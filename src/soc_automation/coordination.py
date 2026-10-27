@@ -1,4 +1,4 @@
-"""Durable coordination only: no evidence retrieval, execution, or publication."""
+"""Durable coordination and fenced report completion; no retrieval or publication."""
 
 import json
 import time
@@ -101,7 +101,7 @@ class InvestigationQueue:
                 result.append(job)
             return result
 
-    def claim(self, owner, *, lease_seconds=60):
+    def claim(self, owner, *, lease_seconds=60, reject_incompatible=False):
         _identifier(owner, 128)
         bounded(lease_seconds, 86400)
         with self.store._connection() as conn:
@@ -116,7 +116,7 @@ class InvestigationQueue:
             ).fetchone()
             if row is None:
                 return None
-            if row["engine_version"] != investigation.ENGINE_VERSION:
+            if row["engine_version"] != investigation.ENGINE_VERSION and not reject_incompatible:
                 raise CoordinationError(FailureCode.ENGINE_MISMATCH)
             conn.execute(
                 "UPDATE investigation_jobs SET state='leased',failure_code=NULL,"
@@ -132,6 +132,9 @@ class InvestigationQueue:
                 (job["id"], job["lease_generation"], owner, now),
             )
             self._audit(conn, job, "claimed", now)
+            if job["engine_version"] != investigation.ENGINE_VERSION:
+                self._finish(conn, job, now, FailureCode.ENGINE_MISMATCH, 0)
+                job["state"] = "failed"
             return job
 
     def _owned(self, conn, job_id, owner, generation, now):
@@ -193,6 +196,77 @@ class InvestigationQueue:
                     "Successful queue completion requires Milestone 5B report persistence"
                 )
             self._finish(conn, job, now, failure, retry_seconds)
+
+    def existing_report(self, job):
+        with self.store._connection(readonly=True) as conn:
+            self.store._validate(conn)
+            row = conn.execute(
+                "SELECT report_json FROM investigations WHERE request_fingerprint=?",
+                (job["request_fingerprint"],),
+            ).fetchone()
+            if row is None:
+                return None
+            report = json.loads(row[0])
+            self._compatible(job, report)
+            return report
+
+    @staticmethod
+    def _compatible(job, report):
+        if (
+            report["request_fingerprint"] != job["request_fingerprint"]
+            or report["engine_version"] != job["engine_version"]
+            or report["source_alert_ids"] != json.loads(job["selection_json"])
+        ):
+            raise StateError("Incompatible investigation report")
+
+    def complete(
+        self,
+        job_id,
+        owner,
+        generation,
+        report,
+        *,
+        adopt=False,
+        partial_failure=FailureCode.PERMANENT,
+    ):
+        """Fence, persist, link, finalize, and audit in one rollback boundary."""
+        if partial_failure not in (FailureCode.PERMANENT, FailureCode.TRANSIENT):
+            raise ValueError("Invalid partial outcome")
+        with self.store._connection() as conn:
+            conn.create_function("coordination_now", 0, self.clock)
+            self.store._validate(conn)
+            job = self._owned(conn, job_id, owner, generation, self.clock())
+            self._compatible(job, report)
+            if adopt:
+                row = conn.execute(
+                    "SELECT report_json FROM investigations WHERE request_fingerprint=?",
+                    (job["request_fingerprint"],),
+                ).fetchone()
+                if row is None or json.loads(row[0]) != report:
+                    raise StateError("Adopted report changed")
+                self.store._validate_report_evidence(conn, report, allow_gaps=True)
+                result = report
+            else:
+                result = self.store._save_investigation(conn, report, job["request_fingerprint"])
+            # Recheck after persistence: a slow transaction cannot commit on an expired lease.
+            now = self.clock()
+            self._owned(conn, job_id, owner, generation, now)
+            code = None if result["status"] == "completed" else partial_failure
+            conn.execute(
+                "UPDATE investigation_job_attempts SET finished_at=?,outcome=? "
+                "WHERE job_id=? AND generation=?",
+                (now, code or "completed", job_id, generation),
+            )
+            state = "completed" if code is None else "failed"
+            conn.execute(
+                "UPDATE investigation_jobs SET state=?,failure_code=?,lease_owner=NULL,"
+                "lease_until=NULL,investigation_id=? WHERE id=?",
+                (state, code, result["investigation_id"], job_id),
+            )
+            self._audit(conn, job, state, now)
+            if self.clock() >= job["lease_until"]:
+                raise StateError("Lease ownership lost")
+            return result
 
     def recover(self, limit=100, *, retry_seconds=60):
         bounded(limit, 1000)

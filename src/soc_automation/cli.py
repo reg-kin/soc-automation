@@ -51,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         choices=(
+            "run-investigation-worker",
             "plan-investigations",
             "enqueue-investigations",
             "show-investigation-job",
@@ -72,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
             "validate-kibana",
         ),
     )
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--max-jobs", type=int, default=1)
     parser.add_argument("--job-id")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--max-attempts", type=int, default=3)
@@ -103,7 +106,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("file, source-id and policy options require the ingest command")
     if args.command not in {"show-alert", "triage", "investigate"} and args.alert_id is not None:
         parser.error("alert-id requires show-alert or triage")
-    if args.evidence_dir is not None and args.command != "investigate":
+    if args.evidence_dir is not None and args.command not in {
+        "investigate",
+        "run-investigation-worker",
+    }:
         parser.error("evidence-dir requires investigate")
     if args.investigation_id is not None and args.command not in {
         "show-investigation",
@@ -115,7 +121,11 @@ def main(argv: list[str] | None = None) -> int:
         "ingest",
     }:
         parser.error("index and id require fetch-alert or Elasticsearch ingest")
-    if args.provider is not None and args.command not in {"investigate", "ingest"}:
+    if args.provider is not None and args.command not in {
+        "investigate",
+        "ingest",
+        "run-investigation-worker",
+    }:
         parser.error("provider requires investigate or ingest")
     if args.command == "ingest":
         if args.provider == "elasticsearch":
@@ -245,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
                 row["decision"] = _safe_decision(row["decision"])
             print(json.dumps({"alerts": results}, sort_keys=True))
             return 0
-        elif args.command == "investigate":
+        elif args.command in {"investigate", "run-investigation-worker"}:
             if args.provider == "elasticsearch":
                 if args.evidence_dir is not None:
                     raise ValueError("Conflicting evidence options")
@@ -254,7 +264,14 @@ def main(argv: list[str] | None = None) -> int:
                 if args.evidence_dir is None:
                     raise ValueError("Evidence directory required")
                 provider = FixtureEvidenceProvider(args.evidence_dir)
-            result = investigate(store, args.alert_id, provider)
+            if args.command == "run-investigation-worker":
+                from soc_automation.worker import InvestigationWorker
+
+                result = InvestigationWorker(store, provider, retry_seconds=args.retry_seconds).run(
+                    max_jobs=1 if args.once else args.max_jobs
+                )
+            else:
+                result = investigate(store, args.alert_id, provider)
             print(json.dumps(result, sort_keys=True))
             return 0
         elif args.command == "show-investigation":

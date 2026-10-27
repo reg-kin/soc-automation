@@ -16,11 +16,15 @@ TRANSITIONS = {
     "completed": frozenset(),
     "failed": frozenset(),
 }
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class StateError(RuntimeError):
     """Persistent state is missing, incompatible, or invalid."""
+
+
+class EvidenceConflict(StateError):
+    """Immutable persisted evidence differs from the supplied snapshot."""
 
 
 def _timestamp() -> str:
@@ -91,6 +95,8 @@ class Store:
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise StateError("Database must be initialized with a supported schema")
         expected = {
+            "investigation_job_report_initial",
+            "investigation_job_report_guard",
             "investigation_jobs_ready",
             "investigation_job_initial",
             "investigation_job_no_delete",
@@ -334,69 +340,72 @@ class Store:
             )
 
     def save_investigation(self, report: dict, fingerprint: str) -> dict:
+        with self._connection() as connection:
+            self._validate(connection)
+            return self._save_investigation(connection, report, fingerprint)
+
+    def _save_investigation(self, connection, report, fingerprint):
+        """Persist under the caller's transaction, preserving immutable evidence."""
         import hashlib
         import json
 
         from soc_automation.ingestion import encode
 
         snapshot = hashlib.sha256(encode(report["retrieved_evidence"]).encode()).hexdigest()
-        with self._connection() as connection:
-            self._validate(connection)
-            for item in report["retrieved_evidence"]:
-                if item["status"] != "found":
-                    continue
-                ref = item["reference"]
-                prior = connection.execute(
-                    "SELECT sha256 FROM investigation_evidence "
-                    "WHERE source_index=? AND document_id=?",
-                    (ref["index"], ref["id"]),
-                ).fetchone()
-                if prior is not None and prior[0] != item["sha256"]:
-                    raise StateError("Conflicting source evidence")
-                connection.execute(
-                    "INSERT OR IGNORE INTO investigation_evidence VALUES(?,?,?,?)",
-                    (ref["index"], ref["id"], item["sha256"], encode(item["document"])),
-                )
+        for item in report["retrieved_evidence"]:
+            if item["status"] != "found":
+                continue
+            ref = item["reference"]
             prior = connection.execute(
-                "SELECT * FROM investigations WHERE request_fingerprint=?", (fingerprint,)
+                "SELECT sha256 FROM investigation_evidence WHERE source_index=? AND document_id=?",
+                (ref["index"], ref["id"]),
             ).fetchone()
-            if prior is not None:
-                if prior["evidence_fingerprint"] != snapshot:
-                    raise StateError("Investigation evidence changed")
-                result = json.loads(prior["report_json"])
-                event = "duplicate"
-            else:
-                result = report
-                connection.execute(
-                    "INSERT INTO investigations VALUES(?,?,?,?)",
-                    (report["investigation_id"], fingerprint, encode(report), snapshot),
-                )
-                for ref in report["evidence_references"]:
-                    connection.execute(
-                        "INSERT INTO investigation_references VALUES(?,?,?)",
-                        (report["investigation_id"], ref["alert_id"], encode(ref)),
-                    )
-                for alert_id in report["source_alert_ids"]:
-                    connection.execute(
-                        "INSERT INTO investigation_alerts VALUES(?,?)",
-                        (report["investigation_id"], alert_id),
-                    )
-                    row = connection.execute(
-                        "SELECT state FROM alerts WHERE id=?", (alert_id,)
-                    ).fetchone()
-                    if row[0] == "triaged":
-                        connection.execute(
-                            "UPDATE alerts SET state='investigating',updated_at=? WHERE id=?",
-                            (_timestamp(), alert_id),
-                        )
-                event = "completed"
+            if prior is not None and prior[0] != item["sha256"]:
+                raise EvidenceConflict("Conflicting source evidence")
             connection.execute(
-                "INSERT INTO investigation_audit"
-                "(investigation_id,correlation_id,event,occurred_at) "
-                "VALUES(?,?,?,?)",
-                (result["investigation_id"], report["audit_correlation_id"], event, _timestamp()),
+                "INSERT OR IGNORE INTO investigation_evidence VALUES(?,?,?,?)",
+                (ref["index"], ref["id"], item["sha256"], encode(item["document"])),
             )
-            return result
+        prior = connection.execute(
+            "SELECT * FROM investigations WHERE request_fingerprint=?", (fingerprint,)
+        ).fetchone()
+        if prior is not None:
+            if prior["evidence_fingerprint"] != snapshot:
+                raise EvidenceConflict("Investigation evidence changed")
+            result = json.loads(prior["report_json"])
+            event = "duplicate"
+        else:
+            result = report
+            connection.execute(
+                "INSERT INTO investigations VALUES(?,?,?,?)",
+                (report["investigation_id"], fingerprint, encode(report), snapshot),
+            )
+            for ref in report["evidence_references"]:
+                connection.execute(
+                    "INSERT INTO investigation_references VALUES(?,?,?)",
+                    (report["investigation_id"], ref["alert_id"], encode(ref)),
+                )
+            for alert_id in report["source_alert_ids"]:
+                connection.execute(
+                    "INSERT INTO investigation_alerts VALUES(?,?)",
+                    (report["investigation_id"], alert_id),
+                )
+                row = connection.execute(
+                    "SELECT state FROM alerts WHERE id=?", (alert_id,)
+                ).fetchone()
+                if row[0] == "triaged":
+                    connection.execute(
+                        "UPDATE alerts SET state='investigating',updated_at=? WHERE id=?",
+                        (_timestamp(), alert_id),
+                    )
+            event = "completed"
+        connection.execute(
+            "INSERT INTO investigation_audit"
+            "(investigation_id,correlation_id,event,occurred_at) "
+            "VALUES(?,?,?,?)",
+            (result["investigation_id"], report["audit_correlation_id"], event, _timestamp()),
+        )
+        return result
 
     def prepare_publication(self, investigation_id, target, payload, *, revise=False):
         from soc_automation.cases import digest
@@ -491,27 +500,32 @@ class Store:
 
     def validate_case_evidence(self, report):
         """Cross-check the immutable report against the separately stored evidence ledger."""
+        with self._connection() as connection:
+            self._validate(connection)
+            self._validate_report_evidence(connection, report)
+
+    def _validate_report_evidence(self, connection, report, *, allow_gaps=False):
         from soc_automation.cases import digest
         from soc_automation.ingestion import encode
 
-        with self._connection() as connection:
-            self._validate(connection)
-            row = connection.execute(
-                "SELECT evidence_fingerprint FROM investigations WHERE id=?",
-                (report["investigation_id"],),
+        row = connection.execute(
+            "SELECT evidence_fingerprint FROM investigations WHERE id=?",
+            (report["investigation_id"],),
+        ).fetchone()
+        if row is None or row[0] != digest(report["retrieved_evidence"]):
+            raise StateError("Investigation snapshot mismatch")
+        for item in report["retrieved_evidence"]:
+            if allow_gaps and item["status"] != "found":
+                continue
+            ref = item["reference"]
+            saved = connection.execute(
+                "SELECT sha256,original_json FROM investigation_evidence "
+                "WHERE source_index=? AND document_id=?",
+                (ref["index"], ref["id"]),
             ).fetchone()
-            if row is None or row[0] != digest(report["retrieved_evidence"]):
-                raise StateError("Investigation snapshot mismatch")
-            for item in report["retrieved_evidence"]:
-                ref = item["reference"]
-                saved = connection.execute(
-                    "SELECT sha256,original_json FROM investigation_evidence "
-                    "WHERE source_index=? AND document_id=?",
-                    (ref["index"], ref["id"]),
-                ).fetchone()
-                if (
-                    saved is None
-                    or saved[0] != item.get("sha256")
-                    or saved[1] != encode(item.get("document"))
-                ):
-                    raise StateError("Stored evidence mismatch")
+            if (
+                saved is None
+                or saved[0] != item.get("sha256")
+                or saved[1] != encode(item.get("document"))
+            ):
+                raise StateError("Stored evidence mismatch")

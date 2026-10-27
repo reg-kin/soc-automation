@@ -150,7 +150,7 @@ def test_v5_upgrade_preserves_publication(tmp_path, monkeypatch):
     assert store.show_case_publication(publication["id"]) == before
     store.healthcheck()
     with store._connection(readonly=True) as c:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert c.execute("PRAGMA user_version").fetchone()[0] == state.SCHEMA_VERSION
 
 
 def test_v6_migration_rollback(tmp_path, monkeypatch):

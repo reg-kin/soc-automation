@@ -3,12 +3,30 @@
 import hashlib
 import re
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
 from soc_automation.ingestion import InputError, Limits, encode, parse
 
 MAX_REFERENCES = 100
+
+
+class RetrievalCode(StrEnum):
+    SUCCESS = "success"
+    MISSING = "missing"
+    TRANSPORT = "transport"
+    RATE_LIMIT = "rate_limit"
+    SERVER = "server"
+    AUTH = "auth"
+    CONFIGURATION = "configuration"
+    INVALID_REFERENCE = "invalid_reference"
+    CONFLICT = "conflict"
+    INVALID_EVIDENCE = "invalid_evidence"
+
+
+class InvalidReference(InputError):
+    code = RetrievalCode.INVALID_REFERENCE
 
 
 @dataclass(frozen=True, order=True)
@@ -23,7 +41,7 @@ class Reference:
                 or not re.fullmatch(r"[A-Za-z0-9_.:@+-]{1,512}", value)
                 or value in {".", ".."}
             ):
-                raise InputError("Unsafe evidence reference")
+                raise InvalidReference("Unsafe evidence reference")
 
 
 @dataclass(frozen=True)
@@ -32,6 +50,26 @@ class Retrieval:
     status: str
     document: dict | None = None
     reason: str | None = None
+
+    @property
+    def code(self):
+        """Map fixed provider protocol codes, never exception diagnostics."""
+        if self.status == "found":
+            return RetrievalCode.SUCCESS
+        if self.status == "missing":
+            return RetrievalCode.MISSING
+        return {
+            "transport_failure": RetrievalCode.TRANSPORT,
+            "connection_timeout": RetrievalCode.TRANSPORT,
+            "read_timeout": RetrievalCode.TRANSPORT,
+            "rate_limited": RetrievalCode.RATE_LIMIT,
+            "server_error": RetrievalCode.SERVER,
+            "authentication_failed": RetrievalCode.AUTH,
+            "authorization_failed": RetrievalCode.AUTH,
+            "tls_verification_failed": RetrievalCode.CONFIGURATION,
+            "index_not_permitted": RetrievalCode.INVALID_REFERENCE,
+            "identity_or_document_invalid": RetrievalCode.CONFLICT,
+        }.get(self.reason, RetrievalCode.INVALID_EVIDENCE)
 
 
 def validate(result: Retrieval, reference: Reference) -> Retrieval:

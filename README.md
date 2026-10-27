@@ -143,3 +143,7 @@ Review the entire frozen payload and target before using its hash. Uncertain out
 require read-only reconciliation and can never trigger an automatic resend. See
 [Stage C architecture, configuration, permissions, recovery and acceptance tests](docs/milestone-4-stage-c.md).
 All Stage C verification is local and mocked; the production target has not been contacted.
+
+Milestone 5B adds bounded execution of queued investigations with renewable leases,
+atomic report linking, typed retrieval outcomes, retries, and terminal partial reports.
+See [worker usage, safety boundaries, and recovery](docs/milestone-5b.md).
