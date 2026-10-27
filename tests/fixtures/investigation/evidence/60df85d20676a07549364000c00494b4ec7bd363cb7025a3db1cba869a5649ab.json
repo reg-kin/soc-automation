@@ -1,0 +1,1 @@
+{"_index": "synthetic-events", "_id": "2", "_source": {"@timestamp": "2026-01-01T10:02:00Z", "event.action": "privilege-change", "process.parent.entity_id": "synthetic-process", "process.entity_id": "synthetic-child"}}

@@ -7,9 +7,10 @@ import sqlite3
 from pathlib import Path
 
 from soc_automation.config import ConfigurationError, Settings
+from soc_automation.evidence import FixtureEvidenceProvider
 from soc_automation.ingestion import Limits, parse
 from soc_automation.logging import configure_logging
-from soc_automation.service import ingest
+from soc_automation.service import ingest, investigate
 from soc_automation.state import StateError, Store
 from soc_automation.triage import Policy
 
@@ -32,11 +33,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SOC automation offline administration")
     parser.add_argument(
         "command",
-        choices=("check-config", "init-db", "healthcheck", "ingest", "triage", "show-alert"),
+        choices=(
+            "check-config",
+            "init-db",
+            "healthcheck",
+            "ingest",
+            "triage",
+            "show-alert",
+            "investigate",
+            "show-investigation",
+        ),
     )
     parser.add_argument("--file", type=Path)
     parser.add_argument("--source-id")
-    parser.add_argument("--alert-id")
+    parser.add_argument("--alert-id", action="append")
+    parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument("--investigation-id")
     parser.add_argument("--policy", type=Path, help="Trusted operator-owned local policy JSON")
     parser.add_argument("--max-input-bytes", type=int, default=4_194_304)
     parser.add_argument("--max-alert-bytes", type=int, default=262_144)
@@ -46,8 +58,12 @@ def main(argv: list[str] | None = None) -> int:
         value is not None for value in (args.file, args.source_id, args.policy)
     ):
         parser.error("file, source-id and policy options require the ingest command")
-    if args.command not in {"show-alert", "triage"} and args.alert_id is not None:
+    if args.command not in {"show-alert", "triage", "investigate"} and args.alert_id is not None:
         parser.error("alert-id requires show-alert or triage")
+    if args.evidence_dir is not None and args.command != "investigate":
+        parser.error("evidence-dir requires investigate")
+    if args.investigation_id is not None and args.command != "show-investigation":
+        parser.error("investigation-id requires show-investigation")
     logger = configure_logging("INFO")
     try:
         settings = Settings.from_env()
@@ -80,10 +96,22 @@ def main(argv: list[str] | None = None) -> int:
                 row["decision"] = _safe_decision(row["decision"])
             print(json.dumps({"alerts": results}, sort_keys=True))
             return 0
+        elif args.command == "investigate":
+            if args.evidence_dir is None:
+                raise ValueError("Evidence directory required")
+            result = investigate(store, args.alert_id, FixtureEvidenceProvider(args.evidence_dir))
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        elif args.command == "show-investigation":
+            result = store.show_investigation(args.investigation_id)
+            print(json.dumps(result, sort_keys=True))
+            return 0
         elif args.command in {"triage", "show-alert"}:
             if not args.alert_id:
                 raise ValueError("Alert identifier required")
-            result = store.show_alert(args.alert_id)
+            if len(args.alert_id) != 1:
+                raise ValueError("One alert required")
+            result = store.show_alert(args.alert_id[0])
             result["decision"] = _safe_decision(result["decision"])
             print(json.dumps(result, sort_keys=True))
             return 0

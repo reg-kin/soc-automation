@@ -1,0 +1,57 @@
+{
+  "_index": "synthetic-alerts",
+  "_id": "multi",
+  "_source": {
+    "@timestamp": "2026-01-01T11:00:00Z",
+    "kibana.alert.ancestors": [
+      {
+        "index": "synthetic-events",
+        "id": "0",
+        "type": "event",
+        "depth": 0
+      },
+      {
+        "index": "synthetic-events",
+        "id": "1",
+        "type": "event",
+        "depth": 0
+      },
+      {
+        "index": "synthetic-events",
+        "id": "1",
+        "type": "event",
+        "depth": 0
+      },
+      {
+        "index": "synthetic-events",
+        "id": "3",
+        "type": "event",
+        "depth": 0
+      },
+      {
+        "index": "synthetic-events",
+        "id": "4",
+        "type": "event",
+        "depth": 0
+      },
+      {
+        "index": "synthetic-events",
+        "id": "5",
+        "type": "event",
+        "depth": 0
+      },
+      {
+        "index": "synthetic-events",
+        "id": "missing",
+        "type": "event",
+        "depth": 0
+      },
+      {
+        "index": "synthetic-events",
+        "id": "wrong",
+        "type": "event",
+        "depth": 0
+      }
+    ]
+  }
+}

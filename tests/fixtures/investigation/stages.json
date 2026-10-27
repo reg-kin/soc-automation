@@ -1,0 +1,47 @@
+[
+  {
+    "_index": "synthetic-alerts",
+    "_id": "0",
+    "_source": {
+      "@timestamp": "2026-01-01T11:00:00Z",
+      "kibana.alert.ancestors": [
+        {
+          "index": "synthetic-events",
+          "id": "0",
+          "type": "event",
+          "depth": 0
+        }
+      ]
+    }
+  },
+  {
+    "_index": "synthetic-alerts",
+    "_id": "1",
+    "_source": {
+      "@timestamp": "2026-01-01T11:00:00Z",
+      "kibana.alert.ancestors": [
+        {
+          "index": "synthetic-events",
+          "id": "1",
+          "type": "event",
+          "depth": 0
+        }
+      ]
+    }
+  },
+  {
+    "_index": "synthetic-alerts",
+    "_id": "2",
+    "_source": {
+      "@timestamp": "2026-01-01T11:00:00Z",
+      "kibana.alert.ancestors": [
+        {
+          "index": "synthetic-events",
+          "id": "2",
+          "type": "event",
+          "depth": 0
+        }
+      ]
+    }
+  }
+]

@@ -26,3 +26,26 @@ def ingest(
     except (ValueError, StateError):
         store.rejection()
         raise
+
+
+def investigate(store: Store, alert_ids: list[str], provider) -> dict:
+    """Changed evidence never replaces prior results."""
+    import sqlite3
+    from uuid import uuid4
+
+    from soc_automation.investigation import build, request_identity
+
+    correlation_id = str(uuid4())
+    try:
+        ids, fingerprint = request_identity(alert_ids)
+        alerts = [store.show_alert(identifier, evidence=True) for identifier in ids]
+        report = build(alerts, provider)
+        report.update(
+            investigation_id="inv-" + fingerprint,
+            request_fingerprint=fingerprint,
+            audit_correlation_id=correlation_id,
+        )
+        return store.save_investigation(report, fingerprint)
+    except (ValueError, StateError, OSError, sqlite3.Error):
+        store.investigation_failure(correlation_id)
+        raise

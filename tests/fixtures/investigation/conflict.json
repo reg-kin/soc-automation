@@ -1,0 +1,8 @@
+{
+  "_index": "synthetic-events",
+  "_id": "0",
+  "_source": {
+    "@timestamp": "2026-01-01T12:00:00Z",
+    "event.action": "changed"
+  }
+}

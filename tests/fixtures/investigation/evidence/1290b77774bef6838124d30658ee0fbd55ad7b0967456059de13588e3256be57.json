@@ -1,0 +1,1 @@
+{"_index": "synthetic-events", "_id": "0", "_source": {"@timestamp": "2026-01-01T10:00:00Z", "event.action": "authentication", "user.id": "synthetic-user", "session.id": "synthetic-session"}}

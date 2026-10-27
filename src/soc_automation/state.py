@@ -15,7 +15,7 @@ TRANSITIONS = {
     "completed": frozenset(),
     "failed": frozenset(),
 }
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class StateError(RuntimeError):
@@ -93,6 +93,11 @@ class Store:
             "audit_transition",
             "audit_no_update",
             "audit_no_delete",
+            "investigation_alerts",
+            "investigations",
+            "investigation_evidence",
+            "investigation_references",
+            "investigation_audit",
             "ingested_alerts",
             "ingestion_audit",
             "ingestion_no_update",
@@ -263,4 +268,91 @@ class Store:
             if evidence:
                 result["normalized"] = json.loads(row["normalized_json"])
                 result["original"] = json.loads(row["original_json"])
+            return result
+
+    def show_investigation(self, investigation_id: str) -> dict:
+        import json
+
+        with self._connection() as connection:
+            self._validate(connection)
+            row = connection.execute(
+                "SELECT report_json FROM investigations WHERE id=?", (investigation_id,)
+            ).fetchone()
+            if row is None:
+                raise StateError("Unknown investigation")
+            return json.loads(row[0])
+
+    def investigation_failure(self, correlation_id: str) -> None:
+        with self._connection() as connection:
+            self._validate(connection)
+            connection.execute(
+                "INSERT INTO investigation_audit"
+                "(investigation_id,correlation_id,event,occurred_at) "
+                "VALUES(NULL,?,'failed',?)",
+                (correlation_id, _timestamp()),
+            )
+
+    def save_investigation(self, report: dict, fingerprint: str) -> dict:
+        import hashlib
+        import json
+
+        from soc_automation.ingestion import encode
+
+        snapshot = hashlib.sha256(encode(report["retrieved_evidence"]).encode()).hexdigest()
+        with self._connection() as connection:
+            self._validate(connection)
+            for item in report["retrieved_evidence"]:
+                if item["status"] != "found":
+                    continue
+                ref = item["reference"]
+                prior = connection.execute(
+                    "SELECT sha256 FROM investigation_evidence "
+                    "WHERE source_index=? AND document_id=?",
+                    (ref["index"], ref["id"]),
+                ).fetchone()
+                if prior is not None and prior[0] != item["sha256"]:
+                    raise StateError("Conflicting source evidence")
+                connection.execute(
+                    "INSERT OR IGNORE INTO investigation_evidence VALUES(?,?,?,?)",
+                    (ref["index"], ref["id"], item["sha256"], encode(item["document"])),
+                )
+            prior = connection.execute(
+                "SELECT * FROM investigations WHERE request_fingerprint=?", (fingerprint,)
+            ).fetchone()
+            if prior is not None:
+                if prior["evidence_fingerprint"] != snapshot:
+                    raise StateError("Investigation evidence changed")
+                result = json.loads(prior["report_json"])
+                event = "duplicate"
+            else:
+                result = report
+                connection.execute(
+                    "INSERT INTO investigations VALUES(?,?,?,?)",
+                    (report["investigation_id"], fingerprint, encode(report), snapshot),
+                )
+                for ref in report["evidence_references"]:
+                    connection.execute(
+                        "INSERT INTO investigation_references VALUES(?,?,?)",
+                        (report["investigation_id"], ref["alert_id"], encode(ref)),
+                    )
+                for alert_id in report["source_alert_ids"]:
+                    connection.execute(
+                        "INSERT INTO investigation_alerts VALUES(?,?)",
+                        (report["investigation_id"], alert_id),
+                    )
+                    row = connection.execute(
+                        "SELECT state FROM alerts WHERE id=?", (alert_id,)
+                    ).fetchone()
+                    if row[0] == "triaged":
+                        connection.execute(
+                            "UPDATE alerts SET state='investigating',updated_at=? WHERE id=?",
+                            (_timestamp(), alert_id),
+                        )
+                event = "completed"
+            connection.execute(
+                "INSERT INTO investigation_audit"
+                "(investigation_id,correlation_id,event,occurred_at) "
+                "VALUES(?,?,?,?)",
+                (result["investigation_id"], report["audit_correlation_id"], event, _timestamp()),
+            )
             return result

@@ -76,3 +76,6 @@ The unit runs as `soc-automation`, sets umask 0077, restricts filesystem access,
 ## License
 
 Apache-2.0; see `LICENSE`.
+
+Milestone 3 adds offline exact-reference evidence retrieval and deterministic investigations.
+See [the Milestone 3 contract and CLI examples](docs/milestone-3.md).
