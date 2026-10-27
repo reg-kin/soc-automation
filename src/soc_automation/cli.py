@@ -13,6 +13,7 @@ from soc_automation.config import (
     KibanaTargetSettings,
     Settings,
 )
+from soc_automation.coordination import InvestigationQueue
 from soc_automation.elasticsearch import ElasticsearchProvider
 from soc_automation.evidence import FixtureEvidenceProvider, Reference
 from soc_automation.ingestion import Limits, encode, parse
@@ -50,6 +51,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         choices=(
+            "plan-investigations",
+            "enqueue-investigations",
+            "show-investigation-job",
+            "list-investigation-jobs",
+            "recover-investigation-jobs",
             "fetch-alert",
             "check-config",
             "init-db",
@@ -66,6 +72,10 @@ def main(argv: list[str] | None = None) -> int:
             "validate-kibana",
         ),
     )
+    parser.add_argument("--job-id")
+    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--retry-seconds", type=int, default=60)
     parser.add_argument("--index", help="Exact Elasticsearch index for fetch-alert or ingest")
     parser.add_argument("--id", help="Exact Elasticsearch document ID")
     parser.add_argument(
@@ -141,6 +151,26 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env()
         logger = configure_logging(settings.log_level)
         store = Store(settings.database_path, settings.database_timeout_seconds)
+        if args.command in {
+            "plan-investigations",
+            "enqueue-investigations",
+            "show-investigation-job",
+            "list-investigation-jobs",
+            "recover-investigation-jobs",
+        }:
+            queue = InvestigationQueue(store)
+            if args.command == "plan-investigations":
+                result = queue.preview(args.limit)
+            elif args.command == "enqueue-investigations":
+                result = queue.enqueue(args.limit, max_attempts=args.max_attempts)
+            elif args.command == "show-investigation-job":
+                result = queue.inspect(args.job_id)
+            elif args.command == "list-investigation-jobs":
+                result = queue.list_jobs(args.limit)
+            else:
+                result = {"recovered": queue.recover(args.limit, retry_seconds=args.retry_seconds)}
+            print(json.dumps(result, sort_keys=True))
+            return 0
         if args.command in {
             "prepare-case",
             "publish-case",

@@ -1,6 +1,7 @@
 """Transactional persistent state and migration ownership."""
 
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ TRANSITIONS = {
     "completed": frozenset(),
     "failed": frozenset(),
 }
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class StateError(RuntimeError):
@@ -40,15 +41,20 @@ class Store:
         self.timeout = timeout
 
     @contextmanager
-    def _connection(self, *, create: bool = False) -> Iterator[sqlite3.Connection]:
+    def _connection(
+        self, *, create: bool = False, readonly: bool = False
+    ) -> Iterator[sqlite3.Connection]:
         # URI mode=rw avoids creating an empty database on health checks or ordinary operations.
-        target = self.path.as_uri() + ("?mode=rwc" if create else "?mode=rw")
+        target = self.path.as_uri() + (
+            "?mode=rwc" if create else "?mode=ro" if readonly else "?mode=rw"
+        )
         connection = sqlite3.connect(target, uri=True, timeout=self.timeout, isolation_level=None)
         connection.row_factory = sqlite3.Row
+        connection.create_function("coordination_now", 0, time.time)
         try:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA synchronous=FULL")
-            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
             yield connection
             connection.commit()
         except BaseException:
@@ -85,6 +91,25 @@ class Store:
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise StateError("Database must be initialized with a supported schema")
         expected = {
+            "investigation_jobs_ready",
+            "investigation_job_initial",
+            "investigation_job_no_delete",
+            "investigation_membership_guard",
+            "investigation_membership_no_update",
+            "investigation_membership_no_delete",
+            "investigation_attempt_guard",
+            "investigation_attempt_no_delete",
+            "investigation_attempt_initial",
+            "investigation_job_lease_time",
+            "investigation_job_terminal",
+            "investigation_jobs",
+            "investigation_job_alerts",
+            "investigation_job_attempts",
+            "investigation_coordination_audit",
+            "investigation_job_transition",
+            "investigation_job_identity",
+            "investigation_coordination_no_update",
+            "investigation_coordination_no_delete",
             "case_publications",
             "publication_heads",
             "publication_head_forward",
