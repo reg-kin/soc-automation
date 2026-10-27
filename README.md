@@ -1,6 +1,6 @@
 # SOC Automation
 
-A modular Python service for persistent SOC alert processing. Milestones 1 and 2 provide local configuration, logging, state, audit history, offline Elastic alert ingestion, deterministic triage and priority, and administrative commands. It makes no external connections and executes no response actions. It has no runtime third-party dependencies.
+A modular Python service for persistent SOC alert processing. Milestones 1 and 2 provide local configuration, logging, state, audit history, offline Elastic alert ingestion, deterministic triage and priority, and administrative commands. The optional Stage A Elasticsearch adapter supports explicit read-only retrieval; all validation is offline. It executes no response actions and has no runtime third-party dependencies.
 
 Python 3.11 or later is required. Development was verified on Ubuntu with Python 3.12.
 
@@ -30,7 +30,7 @@ export SOC_DATABASE_TIMEOUT_SECONDS=5
 .venv/bin/soc-automation healthcheck
 ```
 
-Configuration comes exclusively from the environment; `.env.example` is documentation and is never loaded automatically. `SOC_DATABASE_PATH` is required, absolute, and must end in `soc_automation.db`; its parent directory must already exist. `SOC_LOG_LEVEL` defaults to `INFO` and accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`, and `CRITICAL`. `SOC_DATABASE_TIMEOUT_SECONDS` defaults to 5 and accepts integers 1–60. Unknown `SOC_` variables, empty values, and malformed settings fail validation. Other environment variables are ignored. No Elastic credentials or endpoints are accepted in this milestone.
+Configuration comes exclusively from the environment; `.env.example` is documentation and is never loaded automatically. `SOC_DATABASE_PATH` is required, absolute, and must end in `soc_automation.db`; its parent directory must already exist. `SOC_LOG_LEVEL` defaults to `INFO` and accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`, and `CRITICAL`. `SOC_DATABASE_TIMEOUT_SECONDS` defaults to 5 and accepts integers 1–60. Unknown `SOC_` variables, empty values, and malformed settings fail validation. Other environment variables are ignored. Optional Elasticsearch configuration is documented in [Milestone 4 Stage A](docs/milestone-4-stage-a.md).
 
 Commands emit JSON events to stderr and exit 0 on success or 1 on configuration/database failure. Argument errors exit 2. `--help` needs no configuration. `check-config` validates configuration without opening a database. `init-db` creates or migrates a database transactionally and can be repeated safely. `healthcheck` requires an existing initialized database, validates schema objects, runs SQLite integrity and reference checks, and verifies transaction access. It never initializes state. Failures emit a generic event without exception text; inspect configuration and local database permissions when diagnosing failure.
 
@@ -45,7 +45,7 @@ Commands emit JSON events to stderr and exit 0 on success or 1 on configuration/
 - `service.py`: ingestion orchestration and atomic batch semantics.
 - `cli.py`: local administrative and offline processing entry point.
 
-Offline alert ingestion and deterministic triage/priority assignment are implemented in Milestone 2; see [the Milestone 2 contract and review](docs/milestone-2.md). Investigation orchestration, Elastic Security Cases integration, and response policy/execution remain future responsibilities. No placeholder operational integrations are included. Elastic Agent remains the telemetry source; Elastic Security owns detection and EQL correlation; Elastic Security Cases owns incident management. The existing production Elastic deployment and assurance/remediation platform are outside this repository's scope. There is no separate correlation engine, dashboard, workflow editor, Case system, or SOAR framework.
+Offline alert ingestion and deterministic triage/priority assignment are implemented in Milestone 2; see [the Milestone 2 contract and review](docs/milestone-2.md). Milestone 3 supplies investigation orchestration. Elastic Security Cases integration and response policy/execution remain future responsibilities. Elastic Agent remains the telemetry source; Elastic Security owns detection and EQL correlation; Elastic Security Cases owns incident management. The existing production Elastic deployment and assurance/remediation platform are outside this repository's scope. There is no separate correlation engine, dashboard, workflow editor, Case system, or SOAR framework.
 
 ## Persistent processing contract
 
@@ -79,3 +79,6 @@ Apache-2.0; see `LICENSE`.
 
 Milestone 3 adds offline exact-reference evidence retrieval and deterministic investigations.
 See [the Milestone 3 contract and CLI examples](docs/milestone-3.md).
+
+Milestone 4 Stage A adds a bounded read-only Elasticsearch adapter, verified only
+with mocked HTTP. See [configuration, privileges and CLI persistence semantics](docs/milestone-4-stage-a.md).

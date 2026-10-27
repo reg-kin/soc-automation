@@ -6,8 +6,9 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from soc_automation.config import ConfigurationError, Settings
-from soc_automation.evidence import FixtureEvidenceProvider
+from soc_automation.config import ConfigurationError, ElasticsearchSettings, Settings
+from soc_automation.elasticsearch import ElasticsearchProvider
+from soc_automation.evidence import FixtureEvidenceProvider, Reference
 from soc_automation.ingestion import Limits, parse
 from soc_automation.logging import configure_logging
 from soc_automation.service import ingest, investigate
@@ -34,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         choices=(
+            "fetch-alert",
             "check-config",
             "init-db",
             "healthcheck",
@@ -44,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
             "show-investigation",
         ),
     )
+    parser.add_argument("--index")
+    parser.add_argument("--id")
+    parser.add_argument("--provider", choices=("fixture", "elasticsearch"))
     parser.add_argument("--file", type=Path)
     parser.add_argument("--source-id")
     parser.add_argument("--alert-id", action="append")
@@ -64,12 +69,31 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("evidence-dir requires investigate")
     if args.investigation_id is not None and args.command != "show-investigation":
         parser.error("investigation-id requires show-investigation")
+    if (args.index is not None or args.id is not None) and args.command != "fetch-alert":
+        parser.error("index and id require fetch-alert")
+    if args.provider is not None and args.command != "investigate":
+        parser.error("provider requires investigate")
     logger = configure_logging("INFO")
     try:
         settings = Settings.from_env()
         logger = configure_logging(settings.log_level)
         store = Store(settings.database_path, settings.database_timeout_seconds)
-        if args.command == "check-config":
+        if args.command == "fetch-alert":
+            provider = ElasticsearchProvider(ElasticsearchSettings.from_env())
+            hit = provider.fetch_alert(Reference(args.index, args.id))
+            print(
+                json.dumps(
+                    {
+                        "_index": hit["_index"],
+                        "_id": hit["_id"],
+                        "status": "validated",
+                        "persisted": False,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        elif args.command == "check-config":
             event = "config_valid"
         elif args.command == "init-db":
             store.initialize()
@@ -97,9 +121,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"alerts": results}, sort_keys=True))
             return 0
         elif args.command == "investigate":
-            if args.evidence_dir is None:
-                raise ValueError("Evidence directory required")
-            result = investigate(store, args.alert_id, FixtureEvidenceProvider(args.evidence_dir))
+            if args.provider == "elasticsearch":
+                if args.evidence_dir is not None:
+                    raise ValueError("Conflicting evidence options")
+                provider = ElasticsearchProvider(ElasticsearchSettings.from_env())
+            else:
+                if args.evidence_dir is None:
+                    raise ValueError("Evidence directory required")
+                provider = FixtureEvidenceProvider(args.evidence_dir)
+            result = investigate(store, args.alert_id, provider)
             print(json.dumps(result, sort_keys=True))
             return 0
         elif args.command == "show-investigation":
