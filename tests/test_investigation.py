@@ -1,15 +1,18 @@
 """Synthetic offline investigation contracts, with networking blocked by conftest."""
 
+import hashlib
 import json
 import shutil
 import sqlite3
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from soc_automation.cli import main
 from soc_automation.evidence import FixtureEvidenceProvider, Reference, Retrieval
-from soc_automation.ingestion import InputError
+from soc_automation.ingestion import InputError, encode
+from soc_automation.investigation import build
 from soc_automation.service import ingest, investigate
 from soc_automation.state import StateError, Store
 
@@ -204,3 +207,117 @@ def test_migrate_version_two_preserves_evidence(tmp_path):
         )
         assert conn.execute("SELECT count(*) FROM audit_records").fetchone()[0] == 1
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+
+
+@pytest.mark.parametrize("dotted", [False, True])
+@pytest.mark.parametrize(
+    "value", [0, -1, 1001, 2**80, " user-001 ", None, 1.0, 0.5, True, False, [], [1], {}, "", " "]
+)
+def test_user_id_context_compatibility(dotted, value):
+    reference = Reference("synthetic-events", "numeric-user")
+    source = {"@timestamp": "2026-01-01T00:00:00Z"}
+    source.update({"user.id": value} if dotted else {"user": {"id": value}})
+    document = {"_index": reference.index, "_id": reference.id, "_source": source}
+    provider = Mock()
+    provider.retrieve_many.return_value = [Retrieval(reference, "found", document)]
+    alerts = [
+        {
+            "alert_id": "synthetic-alert",
+            "normalized": {"ancestors": [{"index": reference.index, "id": reference.id}]},
+        }
+    ]
+    report = build(alerts, provider)
+    valid = value is None or type(value) is int or (isinstance(value, str) and bool(value.strip()))
+    assert report["status"] == ("completed" if valid else "partial")
+    evidence = report["retrieved_evidence"][0]
+    assert evidence["document"] == document
+    assert evidence["sha256"] == hashlib.sha256(encode(document).encode()).hexdigest()
+    if valid:
+        for event in report["timeline"] + report["observed_facts"]:
+            assert event["context"]["user.id"] == value
+            assert type(event["context"]["user.id"]) is type(value)
+    else:
+        assert report["timeline"] == report["observed_facts"] == []
+        assert report["evidence_gaps"][0]["reason"] == "invalid_context_or_timestamp"
+
+
+@pytest.mark.parametrize(
+    "left,right,associated",
+    [
+        (1001, 1001, True),
+        (1001, "1001", False),
+        (0, 0, True),
+        (0, "0", False),
+        ("0", 0, False),
+        (0, None, False),
+        (None, None, False),
+        (-1, -1, True),
+        ("user-1", "user-1", True),
+        (0, False, False),
+        (False, 0, False),
+        (0, 0.0, False),
+        (True, True, False),
+        ([], [], False),
+        ("", "", False),
+    ],
+)
+def test_numeric_user_id_correlation_semantics(left, right, associated):
+    references = [Reference("synthetic-events", str(i)) for i in range(2)]
+    provider = Mock()
+    provider.retrieve_many.return_value = [
+        Retrieval(
+            ref,
+            "found",
+            {
+                "_index": ref.index,
+                "_id": ref.id,
+                "_source": {"@timestamp": "2026-01-01T00:00:00Z", "user.id": value},
+            },
+        )
+        for ref, value in zip(references, (left, right), strict=True)
+    ]
+    alerts = [
+        {
+            "alert_id": "synthetic-alert",
+            "normalized": {"ancestors": [{"index": ref.index, "id": ref.id} for ref in references]},
+        }
+    ]
+    report = build(alerts, provider)
+    valid = all(
+        value is None or type(value) is int or (isinstance(value, str) and bool(value.strip()))
+        for value in (left, right)
+    )
+    assert report["status"] == ("completed" if valid else "partial")
+    assert bool(report["supported_inferences"]) is associated
+    if associated:
+        assert report["supported_inferences"][0]["shared_fields"] == ["user.id"]
+
+
+@pytest.mark.parametrize(
+    "key", ["host.id", "session.id", "process.entity_id", "process.parent.entity_id"]
+)
+def test_other_context_identifiers_still_reject_integers(key):
+    ref = Reference("synthetic-events", "other-id")
+    provider = Mock()
+    provider.retrieve_many.return_value = [
+        Retrieval(
+            ref,
+            "found",
+            {
+                "_index": ref.index,
+                "_id": ref.id,
+                "_source": {"@timestamp": "2026-01-01T00:00:00Z", key: 1001},
+            },
+        )
+    ]
+    report = build(
+        [
+            {
+                "alert_id": "synthetic-alert",
+                "normalized": {"ancestors": [{"index": ref.index, "id": ref.id}]},
+            }
+        ],
+        provider,
+    )
+    assert report["status"] == "partial"
+    assert report["observed_facts"] == []

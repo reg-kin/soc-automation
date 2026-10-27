@@ -764,3 +764,69 @@ def test_manual_partial_wins_conflicting_worker_race(setup):
     assert count(q) == 1
     assert count(q, "investigation_evidence") == 0
     assert count(q, "investigation_audit") == 1
+
+
+@pytest.mark.parametrize("execution", ["manual", "worker", "legacy_job"])
+def test_numeric_user_engine_upgrade_preserves_history(setup, monkeypatch, execution):
+    q, _, provider = setup
+    current_version = investigation.ENGINE_VERSION
+    assert current_version == "3.1"
+    identifier = q.preview(1)[0]["alert_id"]
+
+    class NumericProvider:
+        calls = 0
+
+        def retrieve_many(self, refs):
+            self.calls += 1
+            results = provider.retrieve_many(refs)
+            for result in results:
+                if result.status == "found":
+                    result.document["_source"]["user.id"] = 0
+            return results
+
+    numeric = NumericProvider()
+    if execution == "worker":
+        job = q.enqueue(1)[0]
+        assert job["engine_version"] == current_version
+    with monkeypatch.context() as legacy:
+        legacy.setattr(investigation, "ENGINE_VERSION", "3.0")
+        if execution == "legacy_job":
+            job = q.enqueue(1)[0]
+        historical = construct_investigation(q.store, [identifier], numeric)
+        # Reproduce the old engine's rejection of integer context, retaining the
+        # identical evidence bytes so snapshot conflict checks cannot mask reuse.
+        historical.update(
+            status="partial",
+            timeline=[],
+            observed_facts=[],
+            supported_inferences=[],
+            evidence_gaps=[{"reason": "invalid_context_or_timestamp"}],
+        )
+        q.store.save_investigation(historical, historical["request_fingerprint"])
+    with q.store._connection(readonly=True) as conn:
+        audit = list(conn.execute("SELECT * FROM investigation_audit"))
+    calls = numeric.calls
+    if execution == "legacy_job":
+        outcome = worker(q, numeric).run()[0]
+        assert outcome["failure_code"] == "engine_mismatch"
+        assert outcome["investigation_id"] is None
+        assert numeric.calls == calls
+        assert count(q) == 1
+    else:
+        if execution == "worker":
+            assert q.existing_report(job) is None
+            outcome = worker(q, numeric).run()[0]
+            assert outcome["state"] == "completed"
+            corrected = q.store.show_investigation(outcome["investigation_id"])
+        else:
+            corrected = investigate(q.store, [identifier], numeric)
+        assert numeric.calls > calls
+        assert corrected["status"] == "completed"
+        assert corrected["engine_version"] == current_version
+        assert corrected["request_fingerprint"] != historical["request_fingerprint"]
+        assert corrected["investigation_id"] != historical["investigation_id"]
+        assert count(q) == 2
+        assert investigate(q.store, [identifier], numeric) == corrected
+    assert q.store.show_investigation(historical["investigation_id"]) == historical
+    with q.store._connection(readonly=True) as conn:
+        assert list(conn.execute("SELECT * FROM investigation_audit"))[: len(audit)] == audit

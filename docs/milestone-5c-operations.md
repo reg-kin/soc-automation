@@ -54,10 +54,60 @@ without reports to the responsible operator: review fixed failure codes, source
 availability, permissions and configuration through approved channels. Correct causes
 before further work; there is no administrative reset/requeue operation here.
 
-Before an engine-version upgrade, stop scheduled invocations, back up, and drain or
-review pending jobs with the old compatible engine. New workers reject incompatible
-jobs with `engine_mismatch`. Never rewrite immutable job identity or reports to force
-compatibility. Review a new selection through the supported planner when eligible.
+Before upgrading from engine 3.0 to the current engine 3.1, stop scheduled
+invocations and new enqueue activity, take and verify the consistent backup described
+above, and drain the queue using the old compatible engine. Inspect queue health and
+individual jobs: a drain requires zero queued, retry_wait and leased jobs, including
+future delayed retries and unexpired leases. Wait for retries to become eligible;
+after expired leases are explicitly recovered, process their eligible retries with
+the old engine. Review terminal failures separately before upgrading. An empty worker
+batch alone does not prove the queue is drained.
+
+A 3.1 worker claims an eligible 3.0 job and immediately records terminal
+`failed` / `engine_mismatch`, without retrieving evidence or producing/linking a
+report. The claim consumes an attempt and increments the lease generation; the
+attempt ends with `engine_mismatch`, and coordination audit records `claimed` then
+`failed`. This is terminal even with attempts remaining. Delayed legacy retries are
+rejected only once eligible. Legacy leases must first expire and be explicitly
+recovered; recovery records `lease_expired` and schedules a retry if attempts remain,
+or fails an exhausted job. The worker does not recover leases itself.
+
+Failed legacy jobs retain immutable alert membership. Recovery only handles expired
+leases; it cannot revive a failed job. Planner/enqueue exclude alerts already belonging
+to any job, including failed jobs. Upgrading does not make those alerts eligible for a
+replacement job. There is no supported queue reset, replacement or administrative retry.
+Never rewrite job identity, membership, attempts, audit or reports with SQL.
+
+For an explicitly reviewed selection, the existing manual investigation command can
+produce a separate 3.1 investigation using the processing alert UUIDs from
+`show-investigation-job` (`selection`), not source document IDs:
+
+```sh
+soc-automation show-investigation-job --job-id JOB_ID
+soc-automation investigate --alert-id PROCESSING_UUID --provider fixture --evidence-dir /approved/offline/evidence
+soc-automation show-investigation --investigation-id NEW_INVESTIGATION_ID
+soc-automation show-investigation-job --job-id JOB_ID
+```
+
+Repeat `--alert-id` for each deliberately selected alert. The existing read-only
+Elasticsearch procedure uses `--provider elasticsearch` with approved configuration
+instead of fixture/evidence-dir; it contacts Elasticsearch and requires the existing
+read permissions. Use reviewed offline fixtures for an offline rehearsal. Manual
+investigation is an operator decision, not automatic queue recovery. It does not
+repair, replace, complete or relink the original failed job. That job remains failed
+with its original membership, attempts and coordination history. The new report has
+a distinct version-based identity; existing reports and globally pinned evidence
+remain immutable. Changed evidence under a pinned source identity can still cause a
+conflict; engine upgrades do not enable evidence replacement.
+
+Rehearse the upgrade against a separate restored temporary database with offline
+fixtures before touching the intended deployment. Capture read-only queue health,
+job inspection (including attempts/audit), and any historical report before and after;
+verify engine versions, distinct report IDs, the unchanged failed job and retained
+historical records. Record the legacy job ID and new manual report ID in the approved
+operator audit record because the queue does not link them. Protect report/selection
+outputs as sensitive data. Use the integrity checks below on a consistent database;
+inspect report status and evidence gaps rather than treating command exit 0 as success.
 
 Structured JSON events go to stderr (or the journal); stdout stays machine-readable.
 Events cover claim, completion, partial report, retry, failure, mismatch, lease-renewal

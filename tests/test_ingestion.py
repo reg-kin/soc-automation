@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -361,3 +362,41 @@ def test_triage_does_not_accept_ignored_policy():
     with pytest.raises(SystemExit) as error:
         main(["triage", "--alert-id", "unused", "--policy", "unused.json"])
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("dotted", [False, True])
+@pytest.mark.parametrize("value", [0, -1, 1001, 2**80, " user-001 ", None])
+def test_user_id_preservation(dotted, value):
+    item = fixture("minimal")
+    baseline_item = fixture("minimal")
+    if value is not None:
+        baseline_item["_source"]["user.id"] = "user-001"
+    baseline, _ = normalize(baseline_item)
+    item["_source"].update({"user.id": value} if dotted else {"user": {"id": value}})
+    alert, original = normalize(item)
+    assert alert.entities["user.id"] == value
+    assert type(alert.entities["user.id"]) is type(value)
+    assert json.loads(original) == item
+    assert alert.original_ref == hashlib.sha256(original.encode()).hexdigest()
+    assert (alert.source_alert_id, alert.source_index) == (
+        baseline.source_alert_id,
+        baseline.source_index,
+    )
+    assert decide(alert) == decide(baseline)
+
+
+@pytest.mark.parametrize("dotted", [False, True])
+@pytest.mark.parametrize("value", [1.0, 0.5, True, False, [], [1], {}, "", " "])
+def test_invalid_user_id(dotted, value):
+    item = fixture("minimal")
+    item["_source"].update({"user.id": value} if dotted else {"user": {"id": value}})
+    with pytest.raises(InputError, match="Invalid entity identifier"):
+        normalize(item)
+
+
+@pytest.mark.parametrize("path", ["host.id", "host.name", "user.name", "process.entity_id"])
+def test_other_entity_identifiers_still_reject_integers(path):
+    item = fixture("minimal")
+    item["_source"][path] = 1001
+    with pytest.raises(InputError, match="Invalid entity identifier"):
+        normalize(item)

@@ -7,7 +7,7 @@ from itertools import combinations
 from soc_automation.evidence import MAX_REFERENCES, Reference, reference_dict, validate
 from soc_automation.ingestion import InputError, encode, field
 
-ENGINE_VERSION = "3.0"
+ENGINE_VERSION = "3.1"
 CONTEXT = (
     "process.entity_id",
     "process.parent.entity_id",
@@ -62,11 +62,18 @@ def build(alerts, provider):
             try:
                 source = document["_source"]
                 context = {key: field(source, key) for key in CONTEXT}
-                if any(v is not None and not isinstance(v, (str, list)) for v in context.values()):
+                if any(
+                    v is not None
+                    and not isinstance(v, (str, list))
+                    and not (key == "user.id" and type(v) is int)
+                    for key, v in context.items()
+                ):
                     raise InputError("Invalid context")
                 for key in CONTEXT[:5]:
-                    if context[key] is not None and (
-                        not isinstance(context[key], str) or not context[key].strip()
+                    if (
+                        context[key] is not None
+                        and (not isinstance(context[key], str) or not context[key].strip())
+                        and not (key == "user.id" and type(context[key]) is int)
                     ):
                         raise InputError("Invalid identifier")
                 timestamp = field(source, "@timestamp")
@@ -88,7 +95,16 @@ def build(alerts, provider):
     inferences = []
     for left, right in combinations(facts, 2):
         a, b = left["context"], right["context"]
-        supports = [key for key in CONTEXT[:5] if a[key] and a[key] == b[key]]
+        supports = [
+            key
+            for key in CONTEXT[:5]
+            if (
+                (isinstance(a[key], str) and bool(a[key].strip()))
+                or (key == "user.id" and type(a[key]) is int)
+            )
+            and type(a[key]) is type(b[key])
+            and a[key] == b[key]
+        ]
         parent = bool(
             (a["process.entity_id"] and a["process.entity_id"] == b["process.parent.entity_id"])
             or (b["process.entity_id"] and b["process.entity_id"] == a["process.parent.entity_id"])

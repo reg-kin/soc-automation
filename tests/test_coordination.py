@@ -87,10 +87,11 @@ def test_lease_retry_restart_and_fencing(queue):
 def test_success_permanent_typed_and_versions(queue, monkeypatch):
     q, _ = queue
     q.enqueue()
+    current_version = investigation.ENGINE_VERSION
     monkeypatch.setattr(investigation, "ENGINE_VERSION", "future")
     with pytest.raises(StateError):
         q.claim("owner")
-    monkeypatch.setattr(investigation, "ENGINE_VERSION", "3.0")
+    monkeypatch.setattr(investigation, "ENGINE_VERSION", current_version)
     job = q.claim("owner")
     with pytest.raises(ValueError):
         q.finish(job["id"], "owner", 1, failure="timeout text")
