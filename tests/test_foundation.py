@@ -28,6 +28,42 @@ def test_config(tmp_path):
     assert settings.database_timeout_seconds == 5
 
 
+def test_missing_database_path_exact_error():
+    with pytest.raises(
+        ConfigurationError, match="^SOC_DATABASE_PATH must be an absolute file path$"
+    ):
+        Settings.from_env({})
+
+
+@pytest.mark.parametrize("mode", ["empty", "database_only", "partial_es", "unknown_es"])
+def test_check_config_offline_contract(mode, monkeypatch, tmp_path, capsys):
+    for key in list(os.environ):
+        if key.startswith("SOC_"):
+            monkeypatch.delenv(key)
+    path = tmp_path / "soc_automation.db"
+    if mode != "empty":
+        monkeypatch.setenv("SOC_DATABASE_PATH", str(path))
+    if mode == "partial_es":
+        monkeypatch.setenv("SOC_ELASTICSEARCH_URL", "https://elastic.invalid")
+    if mode == "unknown_es":
+        monkeypatch.setenv("SOC_ELASTICSEARCH_UNKNOWN", "invalid")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("check-config must not open a database or create a provider")
+
+    monkeypatch.setattr(sqlite3, "connect", forbidden)
+    monkeypatch.setattr("soc_automation.cli.ElasticsearchProvider", forbidden)
+    success = mode == "database_only"
+    assert main(["check-config"]) == (0 if success else 1)
+    output = capsys.readouterr()
+    assert output.out == ""
+    record = json.loads(output.err)
+    assert record["event"] == ("config_valid" if success else "command_failed")
+    assert record["level"] == ("INFO" if success else "ERROR")
+    assert set(record) == {"timestamp", "level", "event"}
+    assert not path.exists()
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

@@ -34,6 +34,13 @@ Configuration comes exclusively from the environment; `.env.example` is document
 
 Commands emit JSON events to stderr and exit 0 on success or 1 on configuration/database failure. Argument errors exit 2. `--help` needs no configuration. `check-config` validates configuration without opening a database. `init-db` creates or migrates a database transactionally and can be repeated safely. `healthcheck` requires an existing initialized database, validates schema objects, runs SQLite integrity and reference checks, and verifies transaction access. It never initializes state. Failures emit a generic event without exception text; inspect configuration and local database permissions when diagnosing failure.
 
+With no `SOC_` variables, `check-config` exits 1 because `SOC_DATABASE_PATH` is required.
+To validate local configuration without Elasticsearch, supply only an absolute database
+path, for example `SOC_DATABASE_PATH="$PWD/state/soc_automation.db" soc-automation check-config`
+(after creating the private `state` directory as above). This exits 0 without creating
+or opening the database or contacting Elasticsearch. If any `SOC_ELASTICSEARCH_`
+variable is supplied, the complete Elasticsearch configuration must be valid.
+
 ## Architecture and boundaries
 
 - `config.py`: strict environment parsing.
