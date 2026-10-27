@@ -1,0 +1,7 @@
+[Unit]
+Description=Optional bounded investigation invocation (disabled by default)
+
+[Timer]
+OnActiveSec=2min
+OnUnitInactiveSec=5min
+Unit=soc-investigation-worker.service

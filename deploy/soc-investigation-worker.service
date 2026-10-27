@@ -1,0 +1,23 @@
+[Unit]
+Description=Example bounded SOC investigation worker (disabled by default)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Allow the bounded batch to finish within the worker execution limits.
+TimeoutStartSec=1h
+User=soc-automation
+Group=soc-automation
+WorkingDirectory=/var/lib/soc-automation
+# Separate file: SQLite and read-only Elasticsearch only; no Kibana credentials.
+EnvironmentFile=/etc/soc-automation/worker-environment
+ExecStart=/opt/soc-automation/.venv/bin/soc-automation run-investigation-worker --max-jobs 10 --provider elasticsearch
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/soc-automation
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=

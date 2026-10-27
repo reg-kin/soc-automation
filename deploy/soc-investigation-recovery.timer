@@ -1,0 +1,7 @@
+[Unit]
+Description=Optional separate lease recovery invocation (disabled by default)
+
+[Timer]
+OnActiveSec=3min
+OnUnitInactiveSec=5min
+Unit=soc-investigation-recovery.service

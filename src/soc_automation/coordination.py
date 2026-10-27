@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from soc_automation import investigation
 from soc_automation.ingestion import encode
+from soc_automation.logging import operational_event
 from soc_automation.state import StateError, _identifier
 
 
@@ -55,6 +56,62 @@ class InvestigationQueue:
             "(job_id,event,generation,owner,occurred_at) VALUES(?,?,?,?,?)",
             (job["id"], event, job["lease_generation"], job["lease_owner"], now),
         )
+
+    def health(self, limit=100):
+        """One read-only snapshot; aggregates never depend on the pending bound."""
+        bounded(limit, 1000)
+        now = self.clock()
+        states = dict.fromkeys(("queued", "leased", "retry_wait", "completed", "failed"), 0)
+        with self.store._connection(readonly=True) as conn:
+            self.store._validate(conn)
+            states.update(
+                {
+                    r[0]: r[1]
+                    for r in conn.execute(
+                        "SELECT state,count(*) FROM investigation_jobs GROUP BY state"
+                    )
+                }
+            )
+            totals = dict(
+                conn.execute(
+                    "SELECT "
+                    "coalesce(sum(state='queued' AND available_at<=? "
+                    "AND attempt_count<max_attempts),0) AS ready_queued,"
+                    "coalesce(sum(state='retry_wait' AND available_at<=? "
+                    "AND attempt_count<max_attempts),0) AS ready_retries,"
+                    "coalesce(sum(state='retry_wait' AND available_at>?),0) AS delayed_retries,"
+                    "coalesce(sum(state='leased' AND lease_until<=?),0) AS overdue_leases,"
+                    "coalesce(sum(state='failed' AND investigation_id IS NULL),0) "
+                    "AS failed_without_reports "
+                    "FROM investigation_jobs",
+                    (now, now, now, now),
+                ).fetchone()
+            )
+            totals["linked_partial_reports"] = conn.execute(
+                "SELECT count(*) FROM investigation_jobs j JOIN investigations i "
+                "ON i.id=j.investigation_id WHERE json_extract(i.report_json,'$.status')='partial'"
+            ).fetchone()[0]
+            pending = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT id,state,priority,created_at,available_at,lease_until,attempt_count,"
+                    "max_attempts,lease_generation FROM investigation_jobs "
+                    "WHERE state IN ('queued','leased','retry_wait') "
+                    "ORDER BY created_at,id LIMIT ?",
+                    (limit,),
+                )
+            ]
+        total = sum(states[state] for state in ("queued", "leased", "retry_wait"))
+        return {
+            "timestamp": now,
+            "state_counts": states,
+            **totals,
+            "oldest_pending_jobs": pending,
+            "pending_total": total,
+            "pending_limit": limit,
+            "pending_returned": len(pending),
+            "pending_truncated": total > len(pending),
+        }
 
     def preview(self, limit=100):
         bounded(limit, 1000)
@@ -282,7 +339,11 @@ class InvestigationQueue:
             ).fetchall()
             for row in rows:
                 self._finish(conn, dict(row), now, FailureCode.LEASE_EXPIRED, retry_seconds)
-            return len(rows)
+        for row in rows:
+            job = dict(row)
+            job["state"] = "retry_wait" if job["attempt_count"] < job["max_attempts"] else "failed"
+            operational_event("expired_lease_recovery", job, code="lease_expired")
+        return len(rows)
 
     def inspect(self, job_id):
         with self.store._connection(readonly=True) as conn:

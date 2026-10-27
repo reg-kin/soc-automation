@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import sqlite3
+import sys
 from pathlib import Path
 
 from soc_automation.config import (
@@ -46,11 +47,12 @@ def _safe_decision(decision: dict) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="SOC automation administration and alert ingestion"
+        description="SOC automation administration and alert ingestion", allow_abbrev=False
     )
     parser.add_argument(
         "command",
         choices=(
+            "investigation-queue-health",
             "run-investigation-worker",
             "plan-investigations",
             "enqueue-investigations",
@@ -73,8 +75,14 @@ def main(argv: list[str] | None = None) -> int:
             "validate-kibana",
         ),
     )
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--max-jobs", type=int, default=1)
+    batch = parser.add_mutually_exclusive_group()
+    batch.add_argument("--once", action="store_true")
+    batch.add_argument(
+        "--max-jobs",
+        type=int,
+        default=None,
+        help="Bounded worker batch (1-1000); exit 0 means batch completed",
+    )
     parser.add_argument("--job-id")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--max-attempts", type=int, default=3)
@@ -100,6 +108,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-alert-bytes", type=int, default=262_144)
     parser.add_argument("--max-batch-size", type=int, default=100)
     args = parser.parse_args(argv)
+    supplied = argv if argv is not None else sys.argv[1:]
+    option_commands = {
+        "--once": {"run-investigation-worker"},
+        "--max-jobs": {"run-investigation-worker"},
+        "--job-id": {"show-investigation-job"},
+        "--limit": {
+            "plan-investigations",
+            "enqueue-investigations",
+            "list-investigation-jobs",
+            "recover-investigation-jobs",
+            "investigation-queue-health",
+        },
+        "--max-attempts": {"enqueue-investigations"},
+        "--retry-seconds": {"run-investigation-worker", "recover-investigation-jobs"},
+        "--new-revision": {"prepare-case"},
+        "--max-input-bytes": {"ingest"},
+        "--max-alert-bytes": {"ingest"},
+        "--max-batch-size": {"ingest"},
+    }
+    for option, commands in option_commands.items():
+        if (
+            any(token.split("=", 1)[0] == option for token in supplied)
+            and args.command not in commands
+        ):
+            parser.error(f"{option} is not valid for {args.command}")
+    if args.command == "show-investigation-job" and not args.job_id:
+        parser.error("show-investigation-job requires --job-id")
     if args.command != "ingest" and any(
         value is not None for value in (args.file, args.source_id, args.policy)
     ):
@@ -167,9 +202,12 @@ def main(argv: list[str] | None = None) -> int:
             "show-investigation-job",
             "list-investigation-jobs",
             "recover-investigation-jobs",
+            "investigation-queue-health",
         }:
             queue = InvestigationQueue(store)
-            if args.command == "plan-investigations":
+            if args.command == "investigation-queue-health":
+                result = queue.health(args.limit)
+            elif args.command == "plan-investigations":
                 result = queue.preview(args.limit)
             elif args.command == "enqueue-investigations":
                 result = queue.enqueue(args.limit, max_attempts=args.max_attempts)
@@ -268,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
                 from soc_automation.worker import InvestigationWorker
 
                 result = InvestigationWorker(store, provider, retry_seconds=args.retry_seconds).run(
-                    max_jobs=1 if args.once else args.max_jobs
+                    max_jobs=1 if args.max_jobs is None else args.max_jobs
                 )
             else:
                 result = investigate(store, args.alert_id, provider)
