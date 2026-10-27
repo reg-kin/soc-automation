@@ -1,6 +1,6 @@
 # SOC Automation
 
-A modular Python service for persistent SOC alert processing. Milestones 1 and 2 provide local configuration, logging, state, audit history, offline Elastic alert ingestion, deterministic triage and priority, and administrative commands. The optional Stage A Elasticsearch adapter supports explicit read-only retrieval; all validation is offline. It executes no response actions and has no runtime third-party dependencies.
+A modular Python service for persistent SOC alert processing. Milestones 1 and 2 provide local configuration, logging, state, audit history, offline Elastic alert ingestion, deterministic triage and priority, and administrative commands. The optional Stage A Elasticsearch adapter supports explicit read-only retrieval and direct ingestion into SQLite; validation runs locally. It executes no response actions and has no runtime third-party dependencies.
 
 Python 3.11 or later is required. Development was verified on Ubuntu with Python 3.12.
 
@@ -41,6 +41,41 @@ path, for example `SOC_DATABASE_PATH="$PWD/state/soc_automation.db" soc-automati
 or opening the database or contacting Elasticsearch. If any `SOC_ELASTICSEARCH_`
 variable is supplied, the complete Elasticsearch configuration must be valid.
 
+## Direct Elasticsearch alert ingestion
+
+Using the existing configured read-only Elasticsearch connection and initialized SQLite
+database, ingest one exact alert reference from the configured alert index allowlist:
+
+```bash
+soc-automation ingest --provider elasticsearch --index INDEX --id DOCUMENT_ID
+```
+
+Successful stdout is JSON with an `alerts` array containing one result:
+`{"alerts":[{"alert_id":"LOCAL_UUID","duplicate":false,"decision":{...}}]}`.
+The local processing UUID differs from the Elasticsearch document ID. Original `_index`,
+`_id` and document contents are preserved. Identical repeats return the same UUID with
+`duplicate: true` and the original decision; changed content for that identity fails.
+The existing ingestion parser, normalization, size limits, triage and atomic persistence
+apply. Adapter response/document limits, TLS verification, authentication, bounded retries
+and index allowlists also continue to apply. No Elasticsearch writes are performed.
+
+Use that returned UUID for investigation:
+
+```bash
+soc-automation investigate --provider elasticsearch --alert-id LOCAL_UUID
+```
+
+Investigation retrieves exact ancestor references from the configured source index allowlist.
+`fetch-alert --index INDEX --id DOCUMENT_ID` still validates without persistence.
+Offline ingestion remains `soc-automation ingest --file EXPORT.json`; `--source-id` is
+available for an unwrapped offline document. Direct ingestion requires both `--index`
+and `--id`, forbids `--file` and `--source-id`, and accepts the existing `--policy` and
+size-limit options. The `fixture` provider applies only to investigation.
+
+These paths are covered by synthetic HTTP and isolated SQLite tests. Live integration
+has not been verified. Configuration and privilege requirements are in
+[Milestone 4 Stage A](docs/milestone-4-stage-a.md).
+
 ## Architecture and boundaries
 
 - `config.py`: strict environment parsing.
@@ -50,7 +85,7 @@ variable is supplied, the complete Elasticsearch configuration must be valid.
 - `ingestion.py`: bounded offline JSON parsing and typed normalisation.
 - `triage.py`: deterministic, configurable activity classification, disposition and priority.
 - `service.py`: ingestion orchestration and atomic batch semantics.
-- `cli.py`: local administrative and offline processing entry point.
+- `cli.py`: administrative, offline processing and direct Elasticsearch ingestion entry point.
 
 Offline alert ingestion and deterministic triage/priority assignment are implemented in Milestone 2; see [the Milestone 2 contract and review](docs/milestone-2.md). Milestone 3 supplies investigation orchestration. Elastic Security Cases integration and response policy/execution remain future responsibilities. Elastic Agent remains the telemetry source; Elastic Security owns detection and EQL correlation; Elastic Security Cases owns incident management. The existing production Elastic deployment and assurance/remediation platform are outside this repository's scope. There is no separate correlation engine, dashboard, workflow editor, Case system, or SOAR framework.
 
@@ -89,3 +124,22 @@ See [the Milestone 3 contract and CLI examples](docs/milestone-3.md).
 
 Milestone 4 Stage A adds a bounded read-only Elasticsearch adapter, verified only
 with mocked HTTP. See [configuration, privileges and CLI persistence semantics](docs/milestone-4-stage-a.md).
+
+### Milestone 4 Stage C — Elastic Security Cases
+
+Completed investigations can now be prepared locally as frozen, evidence-validated case
+payloads, reviewed, and explicitly authorized for creation in the default Kibana space.
+Publication uses an independent `SOC_KIBANA_*` API key, `securitySolution` ownership,
+verified HTTPS and a durable SQLite migration 004 ledger. Alert syncing is disabled.
+
+```text
+soc-automation prepare-case --investigation-id ID
+soc-automation show-case-publication --publication-id ID
+soc-automation publish-case --publication-id ID --approve-payload-sha256 HASH --authorize-case-creation
+soc-automation reconcile-case --publication-id ID
+```
+
+Review the entire frozen payload and target before using its hash. Uncertain outcomes
+require read-only reconciliation and can never trigger an automatic resend. See
+[Stage C architecture, configuration, permissions, recovery and acceptance tests](docs/milestone-4-stage-c.md).
+All Stage C verification is local and mocked; the production target has not been contacted.

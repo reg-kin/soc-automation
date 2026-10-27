@@ -185,6 +185,26 @@ def test_missing_database_not_created(tmp_path):
     assert not path.exists()
 
 
+@pytest.mark.parametrize("command", ["init-db", "healthcheck"])
+def test_database_commands_reject_partial_es_config(command, monkeypatch, tmp_path, capsys):
+    for key in list(os.environ):
+        if key.startswith("SOC_"):
+            monkeypatch.delenv(key)
+    path = tmp_path / "soc_automation.db"
+    monkeypatch.setenv("SOC_DATABASE_PATH", str(path))
+    monkeypatch.setenv("SOC_ELASTICSEARCH_URL", "https://elastic.invalid")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Invalid configuration must fail before opening a database")
+
+    monkeypatch.setattr(sqlite3, "connect", forbidden)
+    assert main([command]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert json.loads(output.err)["event"] == "command_failed"
+    assert not path.exists()
+
+
 def test_logs_never_emit_untrusted_content():
     output = io.StringIO()
     logger = configure_logging("DEBUG", output)

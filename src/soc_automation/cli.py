@@ -1,4 +1,4 @@
-"""Local-only administrative and offline ingestion commands."""
+"""Administrative commands and local or read-only Elasticsearch ingestion."""
 
 import argparse
 import json
@@ -6,12 +6,25 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from soc_automation.config import ConfigurationError, ElasticsearchSettings, Settings
+from soc_automation.config import (
+    ConfigurationError,
+    ElasticsearchSettings,
+    KibanaSettings,
+    KibanaTargetSettings,
+    Settings,
+)
 from soc_automation.elasticsearch import ElasticsearchProvider
 from soc_automation.evidence import FixtureEvidenceProvider, Reference
-from soc_automation.ingestion import Limits, parse
+from soc_automation.ingestion import Limits, encode, parse
+from soc_automation.kibana import KibanaClient
 from soc_automation.logging import configure_logging
-from soc_automation.service import ingest, investigate
+from soc_automation.service import (
+    ingest,
+    investigate,
+    prepare_case,
+    publish_case,
+    reconcile_case,
+)
 from soc_automation.state import StateError, Store
 from soc_automation.triage import Policy
 
@@ -31,7 +44,9 @@ def _safe_decision(decision: dict) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SOC automation offline administration")
+    parser = argparse.ArgumentParser(
+        description="SOC automation administration and alert ingestion"
+    )
     parser.add_argument(
         "command",
         choices=(
@@ -44,16 +59,29 @@ def main(argv: list[str] | None = None) -> int:
             "show-alert",
             "investigate",
             "show-investigation",
+            "prepare-case",
+            "publish-case",
+            "show-case-publication",
+            "reconcile-case",
+            "validate-kibana",
         ),
     )
-    parser.add_argument("--index")
-    parser.add_argument("--id")
-    parser.add_argument("--provider", choices=("fixture", "elasticsearch"))
-    parser.add_argument("--file", type=Path)
+    parser.add_argument("--index", help="Exact Elasticsearch index for fetch-alert or ingest")
+    parser.add_argument("--id", help="Exact Elasticsearch document ID")
+    parser.add_argument(
+        "--provider",
+        choices=("fixture", "elasticsearch"),
+        help="Ingest: elasticsearch; investigate: fixture (default) or elasticsearch",
+    )
+    parser.add_argument("--file", type=Path, help="Local alert export for offline ingestion")
     parser.add_argument("--source-id")
     parser.add_argument("--alert-id", action="append")
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--investigation-id")
+    parser.add_argument("--publication-id")
+    parser.add_argument("--new-revision", action="store_true")
+    parser.add_argument("--approve-payload-sha256")
+    parser.add_argument("--authorize-case-creation", action="store_true")
     parser.add_argument("--policy", type=Path, help="Trusted operator-owned local policy JSON")
     parser.add_argument("--max-input-bytes", type=int, default=4_194_304)
     parser.add_argument("--max-alert-bytes", type=int, default=262_144)
@@ -67,17 +95,81 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("alert-id requires show-alert or triage")
     if args.evidence_dir is not None and args.command != "investigate":
         parser.error("evidence-dir requires investigate")
-    if args.investigation_id is not None and args.command != "show-investigation":
+    if args.investigation_id is not None and args.command not in {
+        "show-investigation",
+        "prepare-case",
+    }:
         parser.error("investigation-id requires show-investigation")
-    if (args.index is not None or args.id is not None) and args.command != "fetch-alert":
-        parser.error("index and id require fetch-alert")
-    if args.provider is not None and args.command != "investigate":
-        parser.error("provider requires investigate")
+    if (args.index is not None or args.id is not None) and args.command not in {
+        "fetch-alert",
+        "ingest",
+    }:
+        parser.error("index and id require fetch-alert or Elasticsearch ingest")
+    if args.provider is not None and args.command not in {"investigate", "ingest"}:
+        parser.error("provider requires investigate or ingest")
+    if args.command == "ingest":
+        if args.provider == "elasticsearch":
+            if args.file is not None or args.source_id is not None:
+                parser.error("Elasticsearch ingest forbids file and source-id")
+            if args.index is None or args.id is None:
+                parser.error("Elasticsearch ingest requires index and id")
+        elif (
+            args.provider is not None
+            or args.file is None
+            or args.index is not None
+            or args.id is not None
+        ):
+            parser.error("Offline ingest requires file and forbids provider, index and id")
+    if args.command == "fetch-alert" and (args.index is None or args.id is None):
+        parser.error("fetch-alert requires index and id")
+    if (
+        args.authorize_case_creation or args.approve_payload_sha256 is not None
+    ) and args.command != "publish-case":
+        parser.error("approval options require publish-case")
+    if args.publication_id is not None and args.command not in {
+        "publish-case",
+        "show-case-publication",
+        "reconcile-case",
+    }:
+        parser.error("publication-id requires a publication command")
     logger = configure_logging("INFO")
     try:
+        if args.command == "validate-kibana":
+            result = KibanaClient(KibanaSettings.from_env()).validate()
+            print(json.dumps(result, sort_keys=True))
+            return 0
         settings = Settings.from_env()
         logger = configure_logging(settings.log_level)
         store = Store(settings.database_path, settings.database_timeout_seconds)
+        if args.command in {
+            "prepare-case",
+            "publish-case",
+            "show-case-publication",
+            "reconcile-case",
+        }:
+            if args.command == "show-case-publication":
+                result = store.show_case_publication(args.publication_id)
+            elif args.command == "prepare-case":
+                result = prepare_case(
+                    store,
+                    args.investigation_id,
+                    KibanaTargetSettings.from_env(),
+                    revise=args.new_revision,
+                )
+            else:
+                client = KibanaClient(KibanaSettings.from_env())
+                if args.command == "publish-case":
+                    result = publish_case(
+                        store,
+                        args.publication_id,
+                        client,
+                        approval_hash=args.approve_payload_sha256,
+                        authorized=args.authorize_case_creation,
+                    )
+                else:
+                    result = reconcile_case(store, args.publication_id, client)
+            print(json.dumps(result, sort_keys=True))
+            return 0
         if args.command == "fetch-alert":
             provider = ElasticsearchProvider(ElasticsearchSettings.from_env())
             hit = provider.fetch_alert(Reference(args.index, args.id))
@@ -99,8 +191,6 @@ def main(argv: list[str] | None = None) -> int:
             store.initialize()
             event = "database_initialized"
         elif args.command == "ingest":
-            if args.file is None:
-                raise ValueError("File required")
             limits = Limits(args.max_input_bytes, args.max_alert_bytes, args.max_batch_size)
             policy = Policy()
             if args.policy is not None:
@@ -109,12 +199,17 @@ def main(argv: list[str] | None = None) -> int:
                 if len(configuration) != 1:
                     raise ValueError("One policy required")
                 policy = Policy(**configuration[0])
-            try:
-                with args.file.open("rb") as handle:
-                    data = handle.read(limits.input_bytes + 1)
-            except OSError:
-                store.rejection()
-                raise
+            if args.provider == "elasticsearch":
+                provider = ElasticsearchProvider(ElasticsearchSettings.from_env())
+                hit = provider.fetch_alert(Reference(args.index, args.id))
+                data = encode(hit).encode()
+            else:
+                try:
+                    with args.file.open("rb") as handle:
+                        data = handle.read(limits.input_bytes + 1)
+                except OSError:
+                    store.rejection()
+                    raise
             results = ingest(store, data, source_id=args.source_id, limits=limits, policy=policy)
             for row in results:
                 row["decision"] = _safe_decision(row["decision"])

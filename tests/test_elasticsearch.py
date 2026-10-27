@@ -18,7 +18,7 @@ from soc_automation.elasticsearch import ElasticsearchError, ElasticsearchProvid
 from soc_automation.evidence import Reference
 from soc_automation.ingestion import InputError, encode
 from soc_automation.service import ingest, investigate
-from soc_automation.state import Store
+from soc_automation.state import StateError, Store
 
 KEY = base64.b64encode(b"synthetic-id:synthetic-secret").decode()
 FIXTURES = Path(__file__).parent / "fixtures" / "investigation"
@@ -298,9 +298,19 @@ def test_cli_fetch_and_investigate(settings, transport, monkeypatch, tmp_path, c
     assert not database.exists()
     store = Store(database)
     store.initialize()
+    # Fetch validates only: even the remote document ID cannot select a local alert.
+    with pytest.raises(StateError, match="^Unknown ingested alert$"):
+        investigate(store, [alerts[0]["_id"]], provider=ElasticsearchProvider(settings))
+    transport.reset_mock()
+    assert main(["--provider", "elasticsearch", "--alert-id", alerts[0]["_id"], "investigate"]) == 1
+    transport.assert_not_called()
+    assert capsys.readouterr().out == ""
+    with store._connection() as connection:
+        assert connection.execute("SELECT count(*) FROM alerts").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM investigations").fetchone()[0] == 0
     identifier = ingest(store, encode(alerts[0]).encode())[0]["alert_id"]
     response(transport, source())
-    assert main(["investigate", "--alert-id", identifier, "--provider", "elasticsearch"]) == 0
+    assert main(["--provider", "elasticsearch", "--alert-id", identifier, "investigate"]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "completed"
     response(transport, status=403, data=KEY.encode())
     assert main(["fetch-alert", "--index", alerts[0]["_index"], "--id", alerts[0]["_id"]]) == 1

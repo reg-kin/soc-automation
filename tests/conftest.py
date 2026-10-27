@@ -1,5 +1,6 @@
 """Forbid networking during every unit test."""
 
+import os
 import socket
 
 import pytest
@@ -7,6 +8,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def forbid_network(monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("SOC_"):
+            monkeypatch.delenv(key)
+
     def blocked(*args, **kwargs):
         raise AssertionError("Network access is forbidden in foundation tests")
 

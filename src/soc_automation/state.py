@@ -15,7 +15,7 @@ TRANSITIONS = {
     "completed": frozenset(),
     "failed": frozenset(),
 }
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 class StateError(RuntimeError):
@@ -85,6 +85,22 @@ class Store:
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise StateError("Database must be initialized with a supported schema")
         expected = {
+            "case_publications",
+            "publication_heads",
+            "publication_head_forward",
+            "publication_marker_unique",
+            "publication_current_claim",
+            "publication_head_guard",
+            "publication_head_no_delete",
+            "case_publication_audit",
+            "publication_transition",
+            "publication_initial_state",
+            "publication_audit_insert",
+            "publication_audit_transition",
+            "publication_frozen",
+            "publication_no_delete",
+            "publication_audit_no_update",
+            "publication_audit_no_delete",
             "alerts",
             "audit_records",
             "audit_alert_id",
@@ -356,3 +372,121 @@ class Store:
                 (result["investigation_id"], report["audit_correlation_id"], event, _timestamp()),
             )
             return result
+
+    def prepare_publication(self, investigation_id, target, payload, *, revise=False):
+        from soc_automation.cases import digest
+        from soc_automation.ingestion import encode
+
+        with self._connection() as connection:
+            self._validate(connection)
+            previous = connection.execute(
+                "SELECT p.* FROM case_publications p JOIN publication_heads h "
+                "ON p.id=h.publication_id WHERE h.investigation_id=? AND h.target=?",
+                (investigation_id, target),
+            ).fetchone()
+            if previous is not None:
+                if previous["payload_json"] == encode(payload):
+                    return dict(previous)
+                if not revise:
+                    raise StateError("Frozen publication differs; explicitly prepare a revision")
+                if connection.execute(
+                    "SELECT 1 FROM case_publications WHERE investigation_id=? AND target=? "
+                    "AND state!='prepared'",
+                    (investigation_id, target),
+                ).fetchone():
+                    raise StateError("Revision prohibited after send")
+            identifier = str(uuid4())
+            connection.execute(
+                "INSERT INTO case_publications VALUES(?,?,?,?,?,NULL,'prepared',NULL,NULL,?)",
+                (
+                    identifier,
+                    investigation_id,
+                    target,
+                    encode(payload),
+                    digest(payload),
+                    _timestamp(),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO publication_heads VALUES(?,?,?) "
+                "ON CONFLICT(investigation_id,target) DO UPDATE "
+                "SET publication_id=excluded.publication_id",
+                (investigation_id, target, identifier),
+            )
+            return dict(
+                connection.execute(
+                    "SELECT * FROM case_publications WHERE id=?", (identifier,)
+                ).fetchone()
+            )
+
+    def show_case_publication(self, publication_id):
+        with self._connection() as connection:
+            self._validate(connection)
+            row = connection.execute(
+                "SELECT * FROM case_publications WHERE id=?", (publication_id,)
+            ).fetchone()
+            if row is None:
+                raise StateError("Unknown publication")
+            result = dict(row)
+            result["audit"] = [
+                dict(r)
+                for r in connection.execute(
+                    "SELECT * FROM case_publication_audit WHERE publication_id=? ORDER BY id",
+                    (publication_id,),
+                )
+            ]
+            return result
+
+    def claim_publication(self, publication_id, approval_hash):
+        with self._connection() as connection:
+            self._validate(connection)
+            cursor = connection.execute(
+                "UPDATE case_publications SET state='sending',approval_sha256=? "
+                "WHERE id=? AND state='prepared' AND payload_sha256=? "
+                "AND id IN (SELECT publication_id FROM publication_heads)",
+                (approval_hash, publication_id, approval_hash),
+            )
+            return cursor.rowcount == 1
+
+    def publication_outcome(self, publication_id, receipt=None):
+        with self._connection() as connection:
+            self._validate(connection)
+            if receipt is None:
+                connection.execute(
+                    "UPDATE case_publications SET state='uncertain' WHERE id=? AND state='sending'",
+                    (publication_id,),
+                )
+            else:
+                connection.execute(
+                    "UPDATE case_publications SET state='published',"
+                    "remote_case_id=?,remote_version=? "
+                    "WHERE id=? AND state IN ('sending','uncertain')",
+                    (receipt["id"], receipt["version"], publication_id),
+                )
+
+    def validate_case_evidence(self, report):
+        """Cross-check the immutable report against the separately stored evidence ledger."""
+        from soc_automation.cases import digest
+        from soc_automation.ingestion import encode
+
+        with self._connection() as connection:
+            self._validate(connection)
+            row = connection.execute(
+                "SELECT evidence_fingerprint FROM investigations WHERE id=?",
+                (report["investigation_id"],),
+            ).fetchone()
+            if row is None or row[0] != digest(report["retrieved_evidence"]):
+                raise StateError("Investigation snapshot mismatch")
+            for item in report["retrieved_evidence"]:
+                ref = item["reference"]
+                saved = connection.execute(
+                    "SELECT sha256,original_json FROM investigation_evidence "
+                    "WHERE source_index=? AND document_id=?",
+                    (ref["index"], ref["id"]),
+                ).fetchone()
+                if (
+                    saved is None
+                    or saved[0] != item.get("sha256")
+                    or saved[1] != encode(item.get("document"))
+                ):
+                    raise StateError("Stored evidence mismatch")
