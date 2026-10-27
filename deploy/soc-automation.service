@@ -1,0 +1,29 @@
+[Unit]
+Description=SOC automation foundation database health check
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=soc-automation
+Group=soc-automation
+WorkingDirectory=/var/lib/soc-automation
+EnvironmentFile=/etc/soc-automation/environment
+ExecStart=/opt/soc-automation/.venv/bin/soc-automation healthcheck
+StateDirectory=soc-automation
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

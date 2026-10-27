@@ -1,0 +1,30 @@
+{
+  "_index": ".alerts-security.alerts-offline",
+  "_id": "synthetic-001",
+  "_source": {
+    "@timestamp": "2026-10-01T12:00:00Z",
+    "kibana.alert.rule.rule_id": "offline-rule-001",
+    "kibana.alert.rule.name": "Synthetic process detection",
+    "kibana.alert.rule.type": "query",
+    "kibana.alert.severity": "medium",
+    "kibana.alert.risk_score": 45,
+    "host": {
+      "id": "asset-001",
+      "name": "offline-host"
+    },
+    "user": {
+      "id": "user-001",
+      "name": "example-user"
+    },
+    "process": {
+      "pid": 123,
+      "entity_id": "process-001"
+    },
+    "event": {
+      "category": [
+        "process"
+      ],
+      "action": "start"
+    }
+  }
+}

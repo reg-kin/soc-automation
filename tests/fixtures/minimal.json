@@ -1,0 +1,7 @@
+{
+  "_id": "minimal",
+  "_index": ".alerts-security.alerts-offline",
+  "_source": {
+    "@timestamp": "2026-10-01T12:00:00Z"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "version": "offline-example-1",
+  "approved_test_rule_ids": [
+    "approved-offline-test"
+  ]
+}

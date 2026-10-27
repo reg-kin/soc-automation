@@ -1,0 +1,6 @@
+{
+  "_id": 123,
+  "_source": {
+    "@timestamp": "invalid"
+  }
+}
