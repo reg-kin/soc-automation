@@ -10,6 +10,8 @@ from importlib.resources import files
 from pathlib import Path
 from uuid import uuid4
 
+from soc_automation.preparation import PreparationStore
+
 TRANSITIONS = {
     "registered": frozenset({"triaged", "failed"}),
     "triaged": frozenset({"investigating", "failed"}),
@@ -53,7 +55,7 @@ def _canonical_case_target(value):
         return False
 
 
-class Store:
+class Store(PreparationStore):
     def __init__(self, path: Path, timeout: int = 5):
         self.path = Path(path)
         self.timeout = timeout
@@ -453,50 +455,55 @@ class Store:
         return result
 
     def prepare_publication(self, investigation_id, target, payload, *, revise=False):
+        with self._connection() as connection:
+            self._validate(connection)
+            return self._prepare_publication(
+                connection, investigation_id, target, payload, revise=revise
+            )
+
+    def _prepare_publication(self, connection, investigation_id, target, payload, *, revise=False):
         from soc_automation.cases import digest
         from soc_automation.ingestion import encode
 
-        with self._connection() as connection:
-            self._validate(connection)
-            previous = connection.execute(
-                "SELECT p.* FROM case_publications p JOIN publication_heads h "
-                "ON p.id=h.publication_id WHERE h.investigation_id=? AND h.target=?",
+        previous = connection.execute(
+            "SELECT p.* FROM case_publications p JOIN publication_heads h "
+            "ON p.id=h.publication_id WHERE h.investigation_id=? AND h.target=?",
+            (investigation_id, target),
+        ).fetchone()
+        if previous is not None:
+            if previous["payload_json"] == encode(payload):
+                return dict(previous)
+            if not revise:
+                raise StateError("Frozen publication differs; explicitly prepare a revision")
+            if connection.execute(
+                "SELECT 1 FROM case_publications WHERE investigation_id=? AND target=? "
+                "AND state!='prepared'",
                 (investigation_id, target),
+            ).fetchone():
+                raise StateError("Revision prohibited after send")
+        identifier = str(uuid4())
+        connection.execute(
+            "INSERT INTO case_publications VALUES(?,?,?,?,?,NULL,'prepared',NULL,NULL,?)",
+            (
+                identifier,
+                investigation_id,
+                target,
+                encode(payload),
+                digest(payload),
+                _timestamp(),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO publication_heads VALUES(?,?,?) "
+            "ON CONFLICT(investigation_id,target) DO UPDATE "
+            "SET publication_id=excluded.publication_id",
+            (investigation_id, target, identifier),
+        )
+        return dict(
+            connection.execute(
+                "SELECT * FROM case_publications WHERE id=?", (identifier,)
             ).fetchone()
-            if previous is not None:
-                if previous["payload_json"] == encode(payload):
-                    return dict(previous)
-                if not revise:
-                    raise StateError("Frozen publication differs; explicitly prepare a revision")
-                if connection.execute(
-                    "SELECT 1 FROM case_publications WHERE investigation_id=? AND target=? "
-                    "AND state!='prepared'",
-                    (investigation_id, target),
-                ).fetchone():
-                    raise StateError("Revision prohibited after send")
-            identifier = str(uuid4())
-            connection.execute(
-                "INSERT INTO case_publications VALUES(?,?,?,?,?,NULL,'prepared',NULL,NULL,?)",
-                (
-                    identifier,
-                    investigation_id,
-                    target,
-                    encode(payload),
-                    digest(payload),
-                    _timestamp(),
-                ),
-            )
-            connection.execute(
-                "INSERT INTO publication_heads VALUES(?,?,?) "
-                "ON CONFLICT(investigation_id,target) DO UPDATE "
-                "SET publication_id=excluded.publication_id",
-                (investigation_id, target, identifier),
-            )
-            return dict(
-                connection.execute(
-                    "SELECT * FROM case_publications WHERE id=?", (identifier,)
-                ).fetchone()
-            )
+        )
 
     def show_case_publication(self, publication_id):
         with self._connection() as connection:
