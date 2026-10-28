@@ -5,8 +5,10 @@ import json
 import logging
 import sqlite3
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
+from soc_automation import preparation_coordinator
 from soc_automation.config import (
     ConfigurationError,
     ElasticsearchSettings,
@@ -52,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         choices=(
+            "run-case-preparation",
             "investigation-queue-health",
             "run-investigation-worker",
             "plan-investigations",
@@ -87,6 +90,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--retry-seconds", type=int, default=60)
+    parser.add_argument("--discovery-limit", type=int, default=100)
+    parser.add_argument("--processing-limit", type=int, default=50)
+    parser.add_argument("--recovery-limit", type=int, default=100)
+    parser.add_argument("--lease-seconds", type=int, default=60)
     parser.add_argument("--index", help="Exact Elasticsearch index for fetch-alert or ingest")
     parser.add_argument("--id", help="Exact Elasticsearch document ID")
     parser.add_argument(
@@ -110,6 +117,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     supplied = argv if argv is not None else sys.argv[1:]
     option_commands = {
+        "--discovery-limit": {"run-case-preparation"},
+        "--processing-limit": {"run-case-preparation"},
+        "--recovery-limit": {"run-case-preparation"},
+        "--lease-seconds": {"run-case-preparation"},
         "--once": {"run-investigation-worker"},
         "--max-jobs": {"run-investigation-worker"},
         "--job-id": {"show-investigation-job"},
@@ -196,6 +207,17 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env()
         logger = configure_logging(settings.log_level)
         store = Store(settings.database_path, settings.database_timeout_seconds)
+        if args.command == "run-case-preparation":
+            result = preparation_coordinator.run_pass(
+                store,
+                KibanaTargetSettings.from_env().target,
+                discovery_limit=args.discovery_limit,
+                processing_limit=args.processing_limit,
+                recovery_limit=args.recovery_limit,
+                lease_seconds=args.lease_seconds,
+            )
+            print(json.dumps(asdict(result), sort_keys=True))
+            return 1 if result.stopped is not None else 0
         if args.command in {
             "plan-investigations",
             "enqueue-investigations",
