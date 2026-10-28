@@ -27,6 +27,14 @@ class StateError(RuntimeError):
     """Persistent state is missing, incompatible, or invalid."""
 
 
+class PreparationMismatch(StateError):
+    """Deterministic payload or publication incompatibility; no implicit revision."""
+
+
+class RendererMismatch(PreparationMismatch):
+    """The frozen renderer is unsupported."""
+
+
 class EvidenceConflict(StateError):
     """Immutable persisted evidence differs from the supplied snapshot."""
 
@@ -482,7 +490,9 @@ class Store(DiscoveryStore, PreparationStore):
             if previous["payload_json"] == encode(payload):
                 return dict(previous)
             if not revise:
-                raise StateError("Frozen publication differs; explicitly prepare a revision")
+                raise PreparationMismatch(
+                    "Frozen publication differs; explicitly prepare a revision"
+                )
             if connection.execute(
                 "SELECT 1 FROM case_publications WHERE investigation_id=? AND target=? "
                 "AND state!='prepared'",

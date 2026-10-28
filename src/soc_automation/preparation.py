@@ -101,14 +101,19 @@ class PreparationStore:
         )
         return self._preparation_row(conn, identifier)
 
-    def claim_case_preparation(self, *, lease_seconds=60):
+    def claim_case_preparation(self, *, lease_seconds=60, target=None):
         """Claim one ready job with a new opaque owner token; return None when none is ready."""
+        from soc_automation.state import _canonical_case_target
+
+        if target is not None and not _canonical_case_target(target):
+            raise ValueError("Canonical case target required")
         _bound(lease_seconds, 86400)
         with self._connection() as conn:
             self._validate(conn)
             row = conn.execute(
                 f"SELECT id FROM case_preparation_jobs WHERE {READY} "  # noqa: S608
-                "ORDER BY available_at,created_at,id LIMIT 1", (time.time(),),
+                "AND (? IS NULL OR target=?) ORDER BY available_at,created_at,id LIMIT 1",
+                (time.time(), target, target),
             ).fetchone()
             if row is None:
                 return None
@@ -198,7 +203,12 @@ class PreparationStore:
         """
         from soc_automation.cases import RENDERER_VERSION
         from soc_automation.ingestion import encode
-        from soc_automation.state import EvidenceConflict, StateError
+        from soc_automation.state import (
+            EvidenceConflict,
+            PreparationMismatch,
+            RendererMismatch,
+            StateError,
+        )
 
         if (payload is None) == (publication_id is None):
             raise ValueError("Supply payload or publication ID")
@@ -206,7 +216,7 @@ class PreparationStore:
             self._validate(conn)
             job = self._preparation_owned(conn, job_id, owner, generation)
             if job["renderer_version"] != RENDERER_VERSION:
-                raise StateError("Preparation renderer mismatch")
+                raise RendererMismatch("Preparation renderer mismatch")
             current = conn.execute(
                 "SELECT * FROM investigations WHERE id=?", (job["investigation_id"],),
             ).fetchone()
@@ -218,7 +228,7 @@ class PreparationStore:
             expected = self._preparation_payload(conn, json.loads(job["report_json"]))
             if payload is not None:
                 if encode(payload) != encode(expected):
-                    raise StateError("Preparation payload mismatch")
+                    raise PreparationMismatch("Preparation payload mismatch")
                 publication = self._prepare_publication(
                     conn, job["investigation_id"], job["target"], payload,
                 )
@@ -228,7 +238,17 @@ class PreparationStore:
                     "SELECT * FROM case_publications WHERE id=?", (publication_id,),
                 ).fetchone()
                 if publication is None or publication["payload_json"] != encode(expected):
-                    raise StateError("Preparation publication mismatch")
+                    raise PreparationMismatch("Preparation publication mismatch")
+            head = conn.execute(
+                "SELECT publication_id FROM publication_heads "
+                "WHERE investigation_id=? AND target=?",
+                (job["investigation_id"], job["target"]),
+            ).fetchone()
+            if (publication["investigation_id"] != job["investigation_id"]
+                    or publication["target"] != job["target"]
+                    or publication["state"] != "prepared"
+                    or head is None or head["publication_id"] != publication_id):
+                raise PreparationMismatch("Preparation publication association mismatch")
             self._preparation_owned(conn, job_id, owner, generation)
             # Schema 8 validates the current prepared head, investigation and target.
             # Exact rendering is checked above; retain the database association guard.
@@ -262,14 +282,19 @@ class PreparationStore:
                 (job_id, after_id, limit),
             )]
 
-    def eligible_case_preparations(self, *, limit=100):
+    def eligible_case_preparations(self, *, limit=100, target=None):
         """Bounded ready-job metadata, ordered identically to claims."""
+        from soc_automation.state import _canonical_case_target
+
+        if target is not None and not _canonical_case_target(target):
+            raise ValueError("Canonical case target required")
         _bound(limit)
         with self._connection(readonly=True) as conn:
             self._validate(conn)
             return [dict(row) for row in conn.execute(
                 f"SELECT {SUMMARY} FROM case_preparation_jobs WHERE {READY} "  # noqa: S608
-                "ORDER BY available_at,created_at,id LIMIT ?", (time.time(), limit),
+                "AND (? IS NULL OR target=?) ORDER BY available_at,created_at,id LIMIT ?",
+                (time.time(), target, target, limit),
             )]
 
     def case_preparation_stats(self):

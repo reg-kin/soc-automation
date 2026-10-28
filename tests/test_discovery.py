@@ -272,3 +272,90 @@ def test_missing_persisted_investigation_aborts(queue):
         advance(store)
     assert store.case_preparation_discovery_checkpoint(TARGET) == checkpoint
     assert store.case_preparation_stats()["eligible"] == 0
+
+
+@pytest.mark.parametrize("state", ["queued", "leased", "retry_wait", "completed", "failed"])
+def test_capacity_counts_states_and_replays_existing(queue, state):
+    from test_preparation import lease_args
+
+    store, report, payload = queue
+    foreign = store.enqueue_case_preparation(
+        report["investigation_id"], "https://other.test/default/securitySolution",
+    )
+    if state != "queued":
+        job = store.claim_case_preparation()
+        if state == "completed":
+            store.complete_case_preparation(*lease_args(job), payload=payload)
+        elif state != "leased":
+            store.fail_case_preparation(
+                *lease_args(job), failure="transient" if state == "retry_wait" else "permanent",
+            )
+    store.initialize_case_preparation_discovery(TARGET)
+    page = advance(store, outstanding_limit=1)
+    blocked = state in ("queued", "leased", "retry_wait")
+    assert bool(page["records"]) is not blocked
+    assert page["checkpoint"]["historical_cursor"] == (0 if blocked else 1)
+    if blocked:
+        # An independently enqueued identity can be resolved at/above the ceiling.
+        local = store.enqueue_case_preparation(report["investigation_id"], TARGET)
+        replay = advance(store, revision=1, outstanding_limit=1)
+        assert replay["records"][0]["preparation_id"] == local["id"]
+        assert store.show_case_preparation(foreign["id"])["state"] == state
+
+
+@pytest.mark.parametrize("separate", [False, True])
+def test_concurrent_discovery_global_capacity(queue, separate):
+    from threading import Barrier
+
+    store, _, _ = queue
+    targets = [TARGET, "https://other.test/default/securitySolution"]
+    for target in targets:
+        store.initialize_case_preparation_discovery(target)
+    barrier = Barrier(2)
+
+    def admit(target):
+        connection = Store(store.path) if separate else store
+        barrier.wait()
+        return connection.advance_case_preparation_discovery(
+            target, lane="historical", expected_revision=0, outstanding_limit=1,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pages = list(pool.map(admit, targets))
+    assert sorted(len(page["records"]) for page in pages) == [0, 1]
+    assert store.case_preparation_stats()["state_counts"]["queued"] == 1
+    blocked = next(page for page in pages if not page["records"])
+    assert blocked["checkpoint"]["historical_cursor"] == 0
+    # Free the admitted slot, then resume exactly the blocked record.
+    job = store.claim_case_preparation()
+    store.fail_case_preparation(job["id"], job["lease_owner"], job["lease_generation"],
+                                failure="permanent")
+    page = store.advance_case_preparation_discovery(
+        blocked["checkpoint"]["target"], lane="historical", expected_revision=1,
+        outstanding_limit=1,
+    )
+    assert len(page["records"]) == 1
+
+
+def test_capacity_retains_first_unadmitted_record(queue):
+    from test_preparation import FIXTURES
+
+    from soc_automation.evidence import FixtureEvidenceProvider
+    from soc_automation.service import investigate
+
+    store, report, _ = queue
+    store.investigation_failure("between-eligible-records")
+    investigate(store, [report["source_alert_ids"][0]],
+                FixtureEvidenceProvider(FIXTURES / "evidence"))
+    initial = store.initialize_case_preparation_discovery(TARGET)
+    for invalid in (0, True, 2001):
+        with pytest.raises(ValueError):
+            advance(store, outstanding_limit=invalid)
+        assert store.case_preparation_discovery_checkpoint(TARGET) == initial
+    page = advance(store, outstanding_limit=1)
+    assert [record["eligible"] for record in page["records"]] == [True, False]
+    assert page["next_cursor"] == page["checkpoint"]["historical_cursor"] == 2
+    blocked = advance(store, revision=1, outstanding_limit=1)
+    assert blocked["records"] == []
+    assert blocked["next_cursor"] == 2
+    assert store.case_preparation_stats()["state_counts"]["queued"] == 1

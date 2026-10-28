@@ -52,6 +52,29 @@ class DiscoveryStore:
             self._validate(conn)
             return self._discovery_checkpoint(conn, target, renderer_version)
 
+    def case_preparation_discovery_live_first(self, target):
+        """Reserve the next scarce slot for the opposite of the last admitted lane.
+
+        Enqueue audit IDs persist admission order. An identity first seen before the boundary
+        belongs to history; subsequent live events for it are idempotent replays.
+        Direct enqueues may seed the preference but cannot prevent alternation.
+        """
+        renderer_version = _identity(target, None)
+        with self._connection(readonly=True) as conn:
+            self._validate(conn)
+            row = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM investigation_audit a "
+                "WHERE a.investigation_id=j.investigation_id "
+                "AND a.id<=d.historical_high_water) AS historical "
+                "FROM case_preparation_audit e JOIN case_preparation_jobs j ON j.id=e.job_id "
+                "JOIN case_preparation_discovery d "
+                "ON d.target=j.target AND d.renderer_version=j.renderer_version "
+                "WHERE e.event='enqueued' AND j.target=? AND j.renderer_version=? "
+                "ORDER BY e.id DESC LIMIT 1",
+                (target, renderer_version),
+            ).fetchone()
+            return row is not None and not row["historical"]
+
     def _discovery_page(self, conn, checkpoint, lane, limit):
         after = checkpoint[lane + "_cursor"]
         upper = (checkpoint["historical_high_water"] if lane == "historical" else
@@ -108,29 +131,55 @@ class DiscoveryStore:
             return self._discovery_page(conn, checkpoint, lane, limit)
 
     def advance_case_preparation_discovery(self, target, *, lane, expected_revision,
-                                           limit=100, renderer_version=None):
+                                           limit=100, renderer_version=None,
+                                           outstanding_limit=None):
         """Resolve a bounded page and CAS its cursor atomically; stale revisions fail.
 
         Eligible records use the existing idempotent enqueue. Ineligible records are
         resolved by validation against the immutable report in this transaction.
         Unexpected errors roll back both enqueues and checkpoint movement.
+        Optional outstanding_limit (1..2000) bounds global queued, retry_wait and
+        leased jobs at admission, under the same BEGIN IMMEDIATE transaction.
+        Existing identities consume no new capacity; blocked records retain their
+        cursor for replay. Direct enqueues remain outside this admission policy.
         """
         from soc_automation.state import StateError
 
         renderer_version = self._discovery_inputs(target, renderer_version, lane, limit)
         _cursor(expected_revision)
+        if outstanding_limit is not None:
+            _bound(outstanding_limit, 2000)
         with self._connection() as conn:
             self._validate(conn)
             checkpoint = self._discovery_checkpoint(conn, target, renderer_version)
             if checkpoint is None or checkpoint["revision"] != expected_revision:
                 raise StateError("Missing discovery checkpoint or stale revision")
             page = self._discovery_page(conn, checkpoint, lane, limit)
+            outstanding = conn.execute(
+                "SELECT count(*) FROM case_preparation_jobs "
+                "WHERE state IN ('queued','retry_wait','leased')"
+            ).fetchone()[0]
+            resolved = []
             for record in page["records"]:
                 if record["eligible"]:
+                    existing = conn.execute(
+                        "SELECT id FROM case_preparation_jobs WHERE investigation_id=? "
+                        "AND target=? AND renderer_version=? LIMIT 1",
+                        (record["investigation_id"], target, renderer_version),
+                    ).fetchone()
+                    if (existing is None and outstanding_limit is not None
+                            and outstanding >= outstanding_limit):
+                        page["next_cursor"] = (resolved[-1]["audit_id"] if resolved
+                                               else checkpoint[lane + "_cursor"])
+                        break
                     job = self._enqueue_case_preparation(
                         conn, record["investigation_id"], target, 3,
                     )
                     record["preparation_id"] = job["id"]
+                    if existing is None:
+                        outstanding += 1
+                resolved.append(record)
+            page["records"] = resolved
             column = "historical_cursor" if lane == "historical" else "live_cursor"
             changed = conn.execute(
                 f"UPDATE case_preparation_discovery SET {column}=?,revision=revision+1 "  # noqa: S608

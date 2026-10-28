@@ -12,7 +12,7 @@ import pytest
 from soc_automation.cases import render
 from soc_automation.evidence import FixtureEvidenceProvider
 from soc_automation.service import ingest, investigate
-from soc_automation.state import EvidenceConflict, StateError, Store
+from soc_automation.state import EvidenceConflict, PreparationMismatch, StateError, Store
 
 TARGET = "https://example.test/default/securitySolution"
 FIXTURES = Path(__file__).parent / "fixtures" / "investigation"
@@ -236,7 +236,7 @@ def test_publication_mismatch_and_no_implicit_revision(queue):
     newer = store.prepare_publication(
         report["investigation_id"], TARGET, dict(wrong, tags=["new-marker"]), revise=True
     )
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(PreparationMismatch):
         store.complete_case_preparation(*lease_args(job), publication_id=valid["id"])
     assert store.show_case_publication(newer["id"])["state"] == "prepared"
     assert store.show_case_preparation(job["id"])["state"] == "leased"
@@ -311,7 +311,7 @@ def test_wrong_target_publication_and_delayed_claim(queue):
         publication = store.prepare_publication(
             report["investigation_id"], "https://other.test/default/securitySolution", payload,
         )
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(PreparationMismatch):
             store.complete_case_preparation(*lease_args(job), publication_id=publication["id"])
     assert store.show_case_preparation(job["id"])["state"] == "leased"
 
@@ -348,7 +348,7 @@ def test_wrong_investigation_adoption(queue):
     publication = store.prepare_publication("other-investigation", TARGET, payload)
     enqueue(queue)
     job = store.claim_case_preparation()
-    with pytest.raises(sqlite3.IntegrityError, match="invalid prepared publication"):
+    with pytest.raises(PreparationMismatch):
         store.complete_case_preparation(*lease_args(job), publication_id=publication["id"])
     assert store.show_case_preparation(job["id"])["publication_id"] is None
     assert len(store.case_preparation_audit(job["id"])) == 2
@@ -370,7 +370,7 @@ def test_non_prepared_publication_rejected(queue, adopt, state):
     enqueue(queue)
     job = store.claim_case_preparation()
     kwargs = {"publication_id": publication["id"]} if adopt else {"payload": payload}
-    with pytest.raises(sqlite3.IntegrityError, match="invalid prepared publication"):
+    with pytest.raises(PreparationMismatch):
         store.complete_case_preparation(*lease_args(job), **kwargs)
     assert store.show_case_preparation(job["id"])["state"] == "leased"
     assert len(store.case_preparation_audit(job["id"])) == 2
@@ -417,3 +417,43 @@ def test_adoption_association_rollback(queue):
     assert store.show_case_preparation(job["id"]) == before
     assert store.case_preparation_audit(job["id"]) == audit
     assert store.show_case_publication(publication["id"])["state"] == "prepared"
+
+
+@pytest.mark.parametrize("separate", [False, True])
+def test_target_scoped_concurrent_claims(queue, separate):
+    from threading import Barrier
+
+    store, report, _ = queue
+    foreign_target = "https://other.test/default/securitySolution"
+    foreign = store.enqueue_case_preparation(report["investigation_id"], foreign_target)
+    local = enqueue(queue)
+    with pytest.raises(ValueError):
+        store.claim_case_preparation(target="https://invalid")
+    assert store.show_case_preparation(local["id"]) == local
+    barrier = Barrier(4)
+
+    def claim(index):
+        connection = Store(store.path) if separate else store
+        barrier.wait()
+        return connection.claim_case_preparation(target=TARGET if index < 3 else foreign_target)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        jobs = [job for job in pool.map(claim, range(4)) if job]
+    assert {job["id"] for job in jobs} == {local["id"], foreign["id"]}
+    assert all(job["attempt_count"] == job["lease_generation"] == 1 for job in jobs)
+    assert all(len(store.case_preparation_audit(job["id"])) == 2 for job in jobs)
+    assert store.claim_case_preparation(target=TARGET) is None
+
+
+def test_target_claim_oldest_ready_order(queue):
+    store, report, _ = queue
+    with patch("time.time", return_value=100):
+        foreign = store.enqueue_case_preparation(report["investigation_id"],
+                                                 "https://other.test/default/securitySolution")
+        first = enqueue(queue)
+    other = investigate(store, [report["source_alert_ids"][0]],
+                        FixtureEvidenceProvider(FIXTURES / "evidence"))
+    second = store.enqueue_case_preparation(other["investigation_id"], TARGET)
+    assert store.claim_case_preparation(target=TARGET)["id"] == first["id"]
+    assert store.claim_case_preparation(target=TARGET)["id"] == second["id"]
+    assert store.claim_case_preparation()["id"] == foreign["id"]
