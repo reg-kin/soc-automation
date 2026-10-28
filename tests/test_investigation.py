@@ -206,7 +206,7 @@ def test_migrate_version_two_preserves_evidence(tmp_path):
             conn.execute("SELECT state FROM alerts WHERE id='legacy'").fetchone()[0] == "registered"
         )
         assert conn.execute("SELECT count(*) FROM audit_records").fetchone()[0] == 1
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 @pytest.mark.parametrize("dotted", [False, True])

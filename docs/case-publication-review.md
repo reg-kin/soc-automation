@@ -1,6 +1,6 @@
 # Operator discovery and frozen review (Milestone 6.3A)
 
-These commands use schema 9, open the existing database with SQLite `mode=ro`,
+These commands use schema 10, open the existing database with SQLite `mode=ro`,
 validate its schema, and read within one transaction per invocation. They do not
 initialize or migrate the database, construct transport clients, persist rendered artifacts,
 record decisions, publish cases, or update preparation records. Set
@@ -93,7 +93,7 @@ Existing commands retain their behavior.
 
 ## Integrity boundary and limitations
 
-Schema 9 stores a full report hash in preparation jobs and review events, but not
+Schema 10 retains schema 9's full report hash in preparation jobs and review events, but not
 in a publication or investigation row itself. Review uses two verification methods:
 
 - `hash_binding`: every linked preparation must be completed and match the exact
@@ -125,3 +125,19 @@ Checksums detect disagreement with stored bindings; they do not authenticate a
 database against a privileged actor who can rewrite artifacts and all bindings.
 Stored artifact content is operator review material and is returned verbatim.
 This milestone adds no decision recording, authentication, or publication behavior.
+
+The subsequent [internal approval engine](internal-approval.md) reuses this verifier
+on its transaction's connection. The read-only commands and their output remain
+unchanged. Review hash sources describe integrity bindings, not approval
+provenance: only a verified completed preparation binding qualifies for approval.
+
+## Temporary publication restriction
+
+`publish-case` cannot initiate publication until secure policy loading is
+implemented. The CLI does not compose a trusted active policy; authorization flags
+and a durable review approval are insufficient. It fails closed before external
+case creation. There is no permissive default, policy argument, or rotation CLI.
+Preparation and these read-only commands remain available. Reconciliation of
+previously claimed uncertain outcomes keeps its existing behavior. Administrators
+should initialize schema 10 using the existing migration workflow; migration does
+not install policy or authorize publication. See [policy installation and rotation](internal-approval.md).

@@ -94,112 +94,119 @@ class PublicationReviewStore:
 
     def review_case_publication(self, publication_id):
         """Return frozen artifacts verified by bindings or deterministic evidence."""
+        from soc_automation.state import _identifier
+
+        _identifier(publication_id, 256)
+        with self._connection(readonly=True) as conn:
+            self._validate(conn)
+            return self._verify_case_publication(conn, publication_id)
+
+    def _verify_case_publication(self, conn, publication_id):
+        """Private verifier; caller owns the connection, transaction and schema check."""
         from soc_automation.cases import RENDERER_VERSION
         from soc_automation.ingestion import encode
         from soc_automation.state import StateError, _canonical_case_target, _identifier
 
         _identifier(publication_id, 256)
-        with self._connection(readonly=True) as conn:
-            self._validate(conn)
-            row = conn.execute(
-                "SELECT * FROM case_publications WHERE id=?", (publication_id,)
+        row = conn.execute(
+            "SELECT * FROM case_publications WHERE id=?", (publication_id,)
+        ).fetchone()
+        if row is None:
+            raise StateError("Unknown publication")
+        result = dict(row)
+        try:
+            if not _canonical_case_target(row["target"]):
+                raise ValueError("Invalid target")
+            if _sha256(row["payload_json"]) != row["payload_sha256"]:
+                raise ValueError("Payload hash mismatch")
+            payload = _object(row["payload_json"])
+            match = re.match(r"Case rendering format: ([^\s]+)\n", payload["description"])
+            if match is None:
+                raise ValueError("Missing renderer identity")
+            renderer = match[1]
+            investigation = conn.execute(
+                "SELECT * FROM investigations WHERE id=?", (row["investigation_id"],)
             ).fetchone()
-            if row is None:
-                raise StateError("Unknown publication")
-            result = dict(row)
-            try:
-                if not _canonical_case_target(row["target"]):
-                    raise ValueError("Invalid target")
-                if _sha256(row["payload_json"]) != row["payload_sha256"]:
-                    raise ValueError("Payload hash mismatch")
-                payload = _object(row["payload_json"])
-                match = re.match(r"Case rendering format: ([^\s]+)\n", payload["description"])
-                if match is None:
-                    raise ValueError("Missing renderer identity")
-                renderer = match[1]
-                investigation = conn.execute(
-                    "SELECT * FROM investigations WHERE id=?", (row["investigation_id"],)
-                ).fetchone()
-                if investigation is None:
-                    raise ValueError("Missing investigation")
-                report_text = investigation["report_json"]
-                report = _object(report_text)
-                if report["investigation_id"] != row["investigation_id"]:
-                    raise ValueError("Investigation identity mismatch")
-                self._validate_report_evidence(conn, report)
-                report_hash = _sha256(report_text)
-                history = [dict(r) for r in conn.execute(
-                    "SELECT * FROM case_review_events WHERE publication_id=? ORDER BY id",
-                    (publication_id,),
-                )]
-                preparations = conn.execute(
-                    "SELECT * FROM case_preparation_jobs WHERE publication_id=?",
-                    (publication_id,),
-                ).fetchall()
-                bound = bool(history or preparations)
-                if not bound:
-                    if renderer != RENDERER_VERSION:
-                        raise ValueError("Unsupported renderer")
-                    expected = self._preparation_payload(conn, report)
-                    if encode(payload) != encode(expected):
-                        raise ValueError("Deterministic payload mismatch")
-                for job in preparations:
-                    if (job["report_json"] != report_text or job["report_sha256"] != report_hash
-                            or job["investigation_id"] != row["investigation_id"]
-                            or job["target"] != row["target"] or job["renderer_version"] != renderer
-                            or job["evidence_fingerprint"] != investigation["evidence_fingerprint"]
-                            or job["state"] != "completed"):
-                        raise ValueError("Preparation binding mismatch")
-                previous = None
-                for event in history:
-                    if (event["previous_event_id"] != (previous["id"] if previous else None)
-                            or event["payload_sha256"] != row["payload_sha256"]
-                            or event["target"] != row["target"]
-                            or event["report_sha256"] != report_hash
-                            or event["renderer_version"] != renderer):
-                        raise ValueError("Review binding mismatch")
-                    allowed = ({"approved", "declined"} if previous is None
-                               or previous["decision"] in {"declined", "revoked"} else {"revoked"})
-                    if event["decision"] not in allowed:
-                        raise ValueError("Invalid review sequence")
-                    previous = event
-                audit = [dict(r) for r in conn.execute(
-                    "SELECT * FROM case_publication_audit WHERE publication_id=? ORDER BY id",
-                    (publication_id,),
-                )]
-                states = [event["event"] for event in audit]
-                if states not in (["prepared"], ["prepared", "sending"],
-                                  ["prepared", "sending", "uncertain"],
-                                  ["prepared", "sending", "published"],
-                                  ["prepared", "sending", "uncertain", "published"]):
-                    raise ValueError("Invalid transition audit")
-                if states[-1] != row["state"]:
-                    raise ValueError("Publication state mismatch")
-            except (ValueError, TypeError, KeyError, UnicodeError,
-                    AttributeError, IndexError, RecursionError) as error:
-                raise StateError("Frozen publication integrity verification failed") from error
-            head = conn.execute(
-                "SELECT publication_id FROM publication_heads "
-                "WHERE investigation_id=? AND target=?",
-                (row["investigation_id"], row["target"]),
-            ).fetchone()
-            if head is None:
-                raise StateError("Missing publication head")
-            result.update(
-                is_current_head=head[0] == publication_id,
-                payload=payload,
-                payload_sha256_verified=True,
-                report_json=report_text,
-                report=report,
-                report_sha256=report_hash,
-                verification_method="hash_binding" if bound else "deterministic_evidence",
-                report_sha256_verified=bound,
-                report_hash_sources=(["preparation"] if preparations else [])
-                + (["review"] if history else []),
-                renderer_version=renderer,
-                review_status=history[-1]["decision"] if history else "unreviewed",
-                latest_review=history[-1] if history else None,
-                review_history=history,
-                audit=audit,
-            )
-            return result
+            if investigation is None:
+                raise ValueError("Missing investigation")
+            report_text = investigation["report_json"]
+            report = _object(report_text)
+            if report["investigation_id"] != row["investigation_id"]:
+                raise ValueError("Investigation identity mismatch")
+            self._validate_report_evidence(conn, report)
+            report_hash = _sha256(report_text)
+            history = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_review_events WHERE publication_id=? ORDER BY id",
+                (publication_id,),
+            )]
+            preparations = conn.execute(
+                "SELECT * FROM case_preparation_jobs WHERE publication_id=?",
+                (publication_id,),
+            ).fetchall()
+            bound = bool(history or preparations)
+            if not bound:
+                if renderer != RENDERER_VERSION:
+                    raise ValueError("Unsupported renderer")
+                expected = self._preparation_payload(conn, report)
+                if encode(payload) != encode(expected):
+                    raise ValueError("Deterministic payload mismatch")
+            for job in preparations:
+                if (job["report_json"] != report_text or job["report_sha256"] != report_hash
+                        or job["investigation_id"] != row["investigation_id"]
+                        or job["target"] != row["target"] or job["renderer_version"] != renderer
+                        or job["evidence_fingerprint"] != investigation["evidence_fingerprint"]
+                        or job["state"] != "completed"):
+                    raise ValueError("Preparation binding mismatch")
+            previous = None
+            for event in history:
+                if (event["previous_event_id"] != (previous["id"] if previous else None)
+                        or event["payload_sha256"] != row["payload_sha256"]
+                        or event["target"] != row["target"]
+                        or event["report_sha256"] != report_hash
+                        or event["renderer_version"] != renderer):
+                    raise ValueError("Review binding mismatch")
+                allowed = ({"approved", "declined"} if previous is None
+                           or previous["decision"] in {"declined", "revoked"} else {"revoked"})
+                if event["decision"] not in allowed:
+                    raise ValueError("Invalid review sequence")
+                previous = event
+            audit = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_publication_audit WHERE publication_id=? ORDER BY id",
+                (publication_id,),
+            )]
+            states = [event["event"] for event in audit]
+            if states not in (["prepared"], ["prepared", "sending"],
+                              ["prepared", "sending", "uncertain"],
+                              ["prepared", "sending", "published"],
+                              ["prepared", "sending", "uncertain", "published"]):
+                raise ValueError("Invalid transition audit")
+            if states[-1] != row["state"]:
+                raise ValueError("Publication state mismatch")
+        except (ValueError, TypeError, KeyError, UnicodeError,
+                AttributeError, IndexError, RecursionError) as error:
+            raise StateError("Frozen publication integrity verification failed") from error
+        head = conn.execute(
+            "SELECT publication_id FROM publication_heads "
+            "WHERE investigation_id=? AND target=?",
+            (row["investigation_id"], row["target"]),
+        ).fetchone()
+        if head is None:
+            raise StateError("Missing publication head")
+        result.update(
+            is_current_head=head[0] == publication_id,
+            payload=payload,
+            payload_sha256_verified=True,
+            report_json=report_text,
+            report=report,
+            report_sha256=report_hash,
+            verification_method="hash_binding" if bound else "deterministic_evidence",
+            report_sha256_verified=bound,
+            report_hash_sources=(["preparation"] if preparations else [])
+            + (["review"] if history else []),
+            renderer_version=renderer,
+            review_status=history[-1]["decision"] if history else "unreviewed",
+            latest_review=history[-1] if history else None,
+            review_history=history,
+            audit=audit,
+        )
+        return result

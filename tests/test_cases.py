@@ -10,13 +10,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from review_helpers import LegacyClaimStore as Store
 
 from soc_automation.cases import render
 from soc_automation.config import ConfigurationError, KibanaSettings, Settings
 from soc_automation.evidence import FixtureEvidenceProvider
 from soc_automation.kibana import KibanaClient, KibanaError
 from soc_automation.service import ingest, investigate, prepare_case, publish_case, reconcile_case
-from soc_automation.state import StateError, Store
+from soc_automation.state import StateError
 
 FIXTURES = Path(__file__).parent / "fixtures" / "investigation"
 
@@ -278,7 +279,12 @@ def test_cli_workflow(prepared, monkeypatch, capsys):
         ]
         assert main(args) == 1
         client.create.assert_not_called()
-        assert main([*args, "--authorize-case-creation"]) == 0
+        # Production CLI has no trusted active policy in this milestone.
+        assert main([*args, "--authorize-case-creation"]) == 1
+        client.create.assert_not_called()
+        # Retain the historical manual CLI regression with the test-only adapter.
+        with patch("soc_automation.cli.Store", Store):
+            assert main([*args, "--authorize-case-creation"]) == 0
         capsys.readouterr()
         assert main(["reconcile-case", "--publication-id", row["id"]]) == 0
 

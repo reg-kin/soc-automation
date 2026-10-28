@@ -128,7 +128,8 @@ with mocked HTTP. See [configuration, privileges and CLI persistence semantics](
 ### Milestone 4 Stage C — Elastic Security Cases
 
 Completed investigations can now be prepared locally as frozen, evidence-validated case
-payloads, reviewed, and explicitly authorized for creation in the default Kibana space.
+payloads and reviewed. Case creation in the default Kibana space requires trusted
+active-policy composition; the CLI restriction below currently applies.
 Publication uses an independent `SOC_KIBANA_*` API key, `securitySolution` ownership,
 verified HTTPS and a durable SQLite migration 004 ledger. Alert syncing is disabled.
 
@@ -138,6 +139,15 @@ soc-automation show-case-publication --publication-id ID
 soc-automation publish-case --publication-id ID --approve-payload-sha256 HASH --authorize-case-creation
 soc-automation reconcile-case --publication-id ID
 ```
+
+**Temporary publication restriction:** `publish-case` cannot initiate publication
+in this milestone. The CLI has no trusted active-policy loader and its Store fails
+closed, even with a persisted approval and explicit authorization flags. Do not
+supply a default policy or insert approvals to bypass this restriction. Secure
+policy composition and authenticated admission are required before enabling it.
+Read-only review and preparation remain available; reconciliation of previously
+claimed uncertain outcomes retains its existing behavior. See
+[internal approval boundaries](docs/internal-approval.md).
 
 Review the entire frozen payload and target before using its hash. Uncertain outcomes
 require read-only reconciliation and can never trigger an automatic resend. See

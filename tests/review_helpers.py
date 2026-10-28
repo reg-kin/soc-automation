@@ -2,6 +2,8 @@
 
 from uuid import uuid4
 
+from soc_automation.state import Store
+
 
 def approve(store, publication_id):
     with store._connection() as conn:
@@ -17,3 +19,15 @@ def approve(store, publication_id):
             "WHERE p.id=?",
             (str(uuid4()), publication_id),
         )
+
+
+class LegacyClaimStore(Store):
+    """Historical trigger-level harness only; never imported by production code.
+
+    Existing synthetic approvals predate active policy and preparation provenance.
+    Keep those database/service regressions isolated from the production gate.
+    New approval tests must use the real Store.
+    """
+
+    def _check_publication_policy(self, conn, publication_id):
+        pass

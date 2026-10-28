@@ -8,11 +8,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from review_helpers import LegacyClaimStore as Store
 
 from soc_automation.cases import render
 from soc_automation.evidence import FixtureEvidenceProvider
 from soc_automation.service import ingest, investigate
-from soc_automation.state import EvidenceConflict, PreparationMismatch, StateError, Store
+from soc_automation.state import EvidenceConflict, PreparationMismatch, StateError
 
 TARGET = "https://example.test/default/securitySolution"
 FIXTURES = Path(__file__).parent / "fixtures" / "investigation"

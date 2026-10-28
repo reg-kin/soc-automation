@@ -3,6 +3,15 @@
 Target contract: Kibana 8.19.20, default space, owner `securitySolution`.
 Implementation and acceptance testing are local only. No live target validation was performed.
 
+**Current restriction (Milestone 6.3B-1):** the `publish-case` CLI cannot initiate
+publication. It lacks trusted active-policy composition and fails closed, even
+with approval records and explicit authorization flags. The publication examples
+below describe the transport contract, not an enabled CLI workflow. Preparation,
+review, and reconciliation of previously claimed uncertain outcomes remain
+available. Schema 10 migration installs no policy. Do not add a permissive default
+or use manually inserted approvals to bypass the gate; see
+[trusted installation and rotation](internal-approval.md).
+
 ## Architecture
 
 `cases.py` rebuilds the investigation using immutable saved alert and evidence documents.

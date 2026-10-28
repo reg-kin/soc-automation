@@ -10,6 +10,7 @@ from importlib.resources import files
 from pathlib import Path
 from uuid import uuid4
 
+from soc_automation.approval import ApprovalStore, ReviewPolicy
 from soc_automation.discovery import DiscoveryStore
 from soc_automation.preparation import PreparationStore
 from soc_automation.publication_review import PublicationReviewStore
@@ -21,7 +22,7 @@ TRANSITIONS = {
     "completed": frozenset(),
     "failed": frozenset(),
 }
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class StateError(RuntimeError):
@@ -69,8 +70,12 @@ class ReportEvidenceIneligible(StateError):
     """An explicit mismatch against the persisted report evidence ledger."""
 
 
-class Store(DiscoveryStore, PreparationStore, PublicationReviewStore):
-    def __init__(self, path: Path, timeout: int = 5):
+class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalStore):
+    def __init__(self, path: Path, timeout: int = 5, *, publication_policy=None):
+        # Trusted composition only. No environment or CLI policy injection.
+        if publication_policy is not None and type(publication_policy) is not ReviewPolicy:
+            raise ValueError("Validated publication policy required")
+        self._publication_policy = publication_policy
         self.path = Path(path)
         self.timeout = timeout
 
@@ -133,6 +138,10 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore):
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise StateError("Database must be initialized with a supported schema")
         expected = {
+            "review_policy_generations",
+            "policy_generation_insert",
+            "policy_generation_no_update",
+            "policy_generation_no_delete",
             "case_preparation_discovery",
             "discovery_transition",
             "discovery_no_delete",
@@ -545,6 +554,14 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore):
     def claim_publication(self, publication_id, approval_hash):
         with self._connection() as connection:
             self._validate(connection)
+            candidate = connection.execute(
+                "SELECT 1 FROM case_publications WHERE id=? AND state='prepared' "
+                "AND payload_sha256=? AND id IN (SELECT publication_id FROM publication_heads)",
+                (publication_id, approval_hash),
+            ).fetchone()
+            if candidate is None:
+                return False
+            self._check_publication_policy(connection, publication_id)
             cursor = connection.execute(
                 "UPDATE case_publications SET state='sending',approval_sha256=? "
                 "WHERE id=? AND state='prepared' AND payload_sha256=? "
