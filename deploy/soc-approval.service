@@ -1,0 +1,52 @@
+[Unit]
+Description=Authenticated local SOC approval decisions (no publication)
+After=local-fs.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=soc-approval
+Group=soc-approval-operators
+SupplementaryGroups=soc-approval
+WorkingDirectory=/
+ExecStartPre=/opt/soc-automation/.venv/bin/python -I -m soc_automation.approval_daemon --check
+ExecStart=/opt/soc-automation/.venv/bin/python -I -m soc_automation.approval_daemon
+RuntimeDirectory=soc-approval
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+StateDirectory=soc-approval
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=30
+TimeoutStopSec=10
+KillMode=control-group
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/soc-approval /run/soc-approval
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+TasksMax=16
+LimitNOFILE=128
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

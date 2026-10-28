@@ -6,7 +6,8 @@ Install the package with Python 3.11 or later, for example
 These commands load no SOC environment configuration, policy file, database
 credentials, Elasticsearch credentials or Kibana credentials. They never open the
 database. They require Linux and the existing approval service running under
-trusted administrative composition; no launcher or systemd installation is added.
+trusted administrative composition. Offline launcher and systemd assets are described
+in [secure deployment](secure-approval-deployment.md).
 
 ## Commands and exact options
 
@@ -169,7 +170,7 @@ version and a new explicit intent. Rotation may deny historical access.
 
 Trusted service composition, administrative installation/rotation, protected
 paths, account provisioning and review handoff are deployment responsibilities.
-No production infrastructure or systemd changes are included. Shared accounts,
+Offline systemd assets are available; no production infrastructure has been changed. Shared accounts,
 credential forwarding, UID reuse, compromised authorized accounts, privileged
 path writers and database writers retain the limitations documented in the
 [service protocol](approval-socket.md). This CLI does not establish recent human

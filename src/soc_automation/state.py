@@ -3,8 +3,9 @@
 import sqlite3
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
+from functools import cache
 from importlib.resources import files
 from pathlib import Path
 from uuid import uuid4
@@ -23,6 +24,20 @@ TRANSITIONS = {
     "failed": frozenset(),
 }
 SCHEMA_VERSION = 10
+
+
+@cache
+def _policy_schema():
+    """Repository schema 010 as SQLite stores it, not an assumed historical checksum."""
+    with closing(sqlite3.connect(":memory:")) as reference:
+        reference.create_function("sha256_text", 1, sha256_text, deterministic=True)
+        reference.executescript(
+            files("soc_automation").joinpath("migrations/010_initial.sql").read_text("utf-8")
+        )
+        return tuple(reference.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master "
+            "WHERE tbl_name='review_policy_generations' ORDER BY type,name"
+        ))
 
 
 class StateError(RuntimeError):
@@ -158,6 +173,13 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
     def _validate(connection: sqlite3.Connection) -> None:
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise StateError("Database must be initialized with a supported schema")
+        actual = tuple(tuple(row) for row in connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master "
+            "WHERE tbl_name='review_policy_generations' ORDER BY type,name"
+        ))
+        if actual != _policy_schema():
+            raise StateError(
+                "Migration 010 schema incompatible; administrative assessment required")
         expected = {
             "review_policy_generations",
             "policy_generation_insert",

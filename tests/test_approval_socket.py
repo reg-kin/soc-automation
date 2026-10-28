@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import stat
 import struct
 import tempfile
@@ -597,21 +598,12 @@ def test_network_guard_allows_unix_descriptor():
         assert original.fileno() >= 0
 
 
-def test_example_policy_placeholder_grant(setup):
+def test_example_policy_has_no_active_grant():
     from soc_automation.approval_policy import policy_from_content
 
-    _, _, _, _, settings = setup
     example = Path(__file__).resolve().parents[1] / 'deploy/approval-policy.example.json'
-    policy = policy_from_content(example.read_text())
-    assert policy.principals == ((10001, 'example:operator'),)
-    settings = replace(settings, service_uid=10002, special_uids=frozenset())
-    target = next(iter(policy.targets))
-    assert authorize_peer((1, 10001, 123), policy, settings, operation='health',
-                          target=target).principal == 'example:operator'
-    with pytest.raises(AdmissionError, match='unauthorized'):
-        authorize_peer((1, 10003, 123), policy, settings, operation='health', target=target)
-    with pytest.raises(ValueError, match='UID/principal mapping required'):
-        replace(policy, principals=())
+    with pytest.raises(ValueError, match='Invalid UID'):
+        policy_from_content(example.read_text())
 
 
 @pytest.fixture
@@ -843,14 +835,70 @@ def test_decision_peer_authorization(decisions, change):
 
 
 
-def test_concurrent_socket_exact_replay(decisions):
+def test_concurrent_socket_exact_replay(decisions, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
     service, store, request, _, _ = decisions
+    service.settings = replace(service.settings, connection_seconds=30)
+    admitted = threading.Barrier(3, timeout=10)
+    proceed = threading.Event()
+    contending = threading.Event()
+    busy_threads = set()
+    guard = threading.Lock()
+    original_decision = service.store.record_case_decision
+    original_connect = sqlite3.connect
+
+    def decision(**kwargs):
+        # This entry follows peer, request and active-authority admission checks.
+        admitted.wait()
+        assert proceed.wait(10)
+        return original_decision(**kwargs)
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            try:
+                return super().execute(sql, *args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if sql == 'BEGIN IMMEDIATE' and exc.sqlite_errorcode == sqlite3.SQLITE_BUSY:
+                    with guard:
+                        busy_threads.add(threading.get_ident())
+                        if len(busy_threads) == 2:
+                            contending.set()
+                raise
+
+    def connect(*args, **kwargs):
+        return original_connect(*args, **kwargs, factory=Connection)
+
+    def send():
+        encoded = json.dumps(request).encode()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(30)
+            client.connect(str(service.settings.path))
+            client.sendall(struct.pack('!I', len(encoded)) + encoded)
+            client.shutdown(socket.SHUT_WR)
+            return receive(client)
+
+    monkeypatch.setattr(service.store, 'record_case_decision', decision)
+    monkeypatch.setattr(sqlite3, 'connect', connect)
+    blocker = original_connect(store.path, isolation_level=None)
     with ThreadPoolExecutor(2) as pool:
-        results = list(pool.map(lambda _: exchange(service, request), range(2)))
+        futures = [pool.submit(send) for _ in range(2)]
+        try:
+            admitted.wait()
+            blocker.execute('BEGIN IMMEDIATE')
+            proceed.set()
+            # Both writers must actually encounter SQLite's held writer lock.
+            assert contending.wait(10)
+            blocker.rollback()
+            results = [future.result(timeout=15) for future in futures]
+        finally:
+            admitted.abort()
+            proceed.set()
+            blocker.rollback()
+            blocker.close()
     assert results[0] == results[1]
     assert results[0]['ok']
+    assert results[0]['event_id'] == results[1]['event_id']
     assert event_count(store) == 1
 
 

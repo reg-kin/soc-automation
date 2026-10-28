@@ -72,13 +72,11 @@ access-time updates are deliberately excluded. Privileged path writers remain
 trusted; this is not protection from a malicious administrator.
 
 The policy is a complete JSON encoding of the existing `ReviewPolicy` fields;
-[the example](../deploy/approval-policy.example.json) contains an effective
-placeholder grant: UID 10001 maps to `example:operator` and can authenticate for
-health and decisions on the example target (subject to the root/service UID restrictions).
-The existing schema requires at least one UID mapping, so this is not a
-deny-by-default policy. Replace this grant with reviewed operator UIDs and
-principals, and replace the target and version before installation. Never install
-the example unchanged. Arrays represent tuples and sets. All fields are required;
+[the template](../deploy/approval-policy.example.json) intentionally has a string
+UID placeholder and fails validation. It contains no active numeric UID grant.
+Replace it with reviewed operator UIDs and principals, and replace the target and
+version before protected candidate validation. Never install the template unchanged.
+Arrays represent tuples and sets. All fields are required;
 unknown fields, duplicate keys, duplicate set items, floats (including overflow),
 nonfinite constants, invalid UTF-8, and invalid policy types/values are rejected.
 The maximum input is 65,536 bytes. The loader reconstructs `ReviewPolicy` and uses
@@ -101,8 +99,9 @@ There is no hot reload; rotation requires restarting with the new policy file.
 Protect the database, its parent, journal/WAL files, backups, and all processes
 with database write access. The loader verifies ledger consistency; it does not
 cryptographically authenticate a database against a writer who can forge the
-entire ledger. Existing schema validation checks required schema objects, not
-maliciously rewritten trigger bodies. Publication and approval persistence retain
+entire ledger. Schema validation now compares migration 010 policy objects with
+the repository definitions; other migrations still check required object names
+rather than all bodies. Publication and approval persistence retain
 their existing independent checks. Decisions recheck authority inside the existing
 atomic decision transaction.
 
@@ -155,7 +154,8 @@ configured group, then mode 0660. A nonroot service can do this when it owns the
 directory/socket and belongs to the operator group. Start before other application
 threads: umask is process-global. It is restored immediately after bind. Put the
 accept loop in `serve_forever()` and arrange a trusted signal handler to call
-`close()`; no signal handler or production launcher is installed here.
+`close()`; the deployment launcher now supplies signal handling; see
+[secure deployment](secure-approval-deployment.md).
 
 Any existing socket path, even an apparently stale socket, prevents startup.
 No automatic unlink occurs. A concurrent listener remains excluded even if its
@@ -308,9 +308,9 @@ recent human authentication, supervisor hardening, administrator authentication,
 backup integrity and production procfs availability. Authorized account compromise
 can exercise that account's policy. Database writers and trusted in-process code
 remain privileged. Checksums do not defend against a writer rewriting every binding.
-No production deployment is certified. The example UID 10001 grant is effective
-and must be replaced before deployment. Operator CLI and production composition
-remain separate work.
+No production deployment is certified. The template is intentionally invalid until
+provisioned. See [secure deployment](secure-approval-deployment.md) for the launcher
+and offline deployment checks.
 
 Decision execution uses the same absolute monotonic deadline established when
 accepting the connection; admission and database delays never renew it. The durable
@@ -331,3 +331,6 @@ is used. Response delivery can time out or the client can disconnect after commi
 Retry the exact original intent with its original request ID: an authorized exact
 replay returns the existing event without adding an event or changing the review
 head. Current UID, operation and target authorization still apply to every retry.
+
+Production assets and current operational requirements are documented in
+[secure approval deployment](secure-approval-deployment.md).

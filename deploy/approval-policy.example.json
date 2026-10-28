@@ -8,7 +8,7 @@
   "decline_provenance": "verified_evidence",
   "principals": [
     [
-      10001,
+      "REPLACE_WITH_REVIEWED_NUMERIC_UID",
       "example:operator"
     ]
   ],
