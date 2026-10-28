@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from soc_automation.discovery import DiscoveryStore
 from soc_automation.preparation import PreparationStore
+from soc_automation.publication_review import PublicationReviewStore
 
 TRANSITIONS = {
     "registered": frozenset({"triaged", "failed"}),
@@ -68,7 +69,7 @@ class ReportEvidenceIneligible(StateError):
     """An explicit mismatch against the persisted report evidence ledger."""
 
 
-class Store(DiscoveryStore, PreparationStore):
+class Store(DiscoveryStore, PreparationStore, PublicationReviewStore):
     def __init__(self, path: Path, timeout: int = 5):
         self.path = Path(path)
         self.timeout = timeout

@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         choices=(
+            "list-case-publications",
+            "review-case-publication",
             "run-case-preparation",
             "investigation-queue-health",
             "run-investigation-worker",
@@ -86,6 +88,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Bounded worker batch (1-1000); exit 0 means batch completed",
     )
+    parser.add_argument(
+        "--review-status", choices=("unreviewed", "approved", "declined", "revoked")
+    )
+    parser.add_argument("--target", help="Canonical case target, or configured for SOC_KIBANA_URL")
+    parser.add_argument("--cursor", help="Continuation cursor from list-case-publications")
     parser.add_argument("--job-id")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--max-attempts", type=int, default=3)
@@ -117,6 +124,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     supplied = argv if argv is not None else sys.argv[1:]
     option_commands = {
+        "--review-status": {"list-case-publications"},
+        "--target": {"list-case-publications"},
+        "--cursor": {"list-case-publications"},
         "--discovery-limit": {"run-case-preparation"},
         "--processing-limit": {"run-case-preparation"},
         "--recovery-limit": {"run-case-preparation"},
@@ -125,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         "--max-jobs": {"run-investigation-worker"},
         "--job-id": {"show-investigation-job"},
         "--limit": {
+            "list-case-publications",
             "plan-investigations",
             "enqueue-investigations",
             "list-investigation-jobs",
@@ -144,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
             and args.command not in commands
         ):
             parser.error(f"{option} is not valid for {args.command}")
+    if args.command == "review-case-publication" and not args.publication_id:
+        parser.error("review-case-publication requires --publication-id")
+    if args.command == "list-case-publications" and not 1 <= args.limit <= 1000:
+        parser.error("limit must be between 1 and 1000")
     if args.command == "show-investigation-job" and not args.job_id:
         parser.error("show-investigation-job requires --job-id")
     if args.command != "ingest" and any(
@@ -193,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     ) and args.command != "publish-case":
         parser.error("approval options require publish-case")
     if args.publication_id is not None and args.command not in {
+        "review-case-publication",
         "publish-case",
         "show-case-publication",
         "reconcile-case",
@@ -207,6 +223,18 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env()
         logger = configure_logging(settings.log_level)
         store = Store(settings.database_path, settings.database_timeout_seconds)
+        if args.command in {"list-case-publications", "review-case-publication"}:
+            if args.command == "list-case-publications":
+                target = args.target
+                if target == "configured":
+                    target = KibanaTargetSettings.from_env().target
+                result = store.list_case_publications(
+                    args.limit, review_status=args.review_status, target=target, cursor=args.cursor
+                )
+            else:
+                result = store.review_case_publication(args.publication_id)
+            print(json.dumps(result, sort_keys=True))
+            return 0
         if args.command == "run-case-preparation":
             result = preparation_coordinator.run_pass(
                 store,
