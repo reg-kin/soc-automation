@@ -104,7 +104,7 @@ class Schema8Tests(unittest.TestCase):
         self.store.initialize()
         self.store.healthcheck()
         with self.store._connection() as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 9)
         self.sql("DROP INDEX case_review_publication")
         with self.assertRaises(StateError):
             self.store.healthcheck()

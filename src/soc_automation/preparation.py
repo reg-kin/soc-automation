@@ -35,9 +35,11 @@ class PreparationStore:
         return dict(row)
 
     def _preparation_payload(self, conn, report):
-        from soc_automation.cases import render
+        from soc_automation.cases import ReportIneligible, render
         from soc_automation.state import StateError
 
+        if report["status"] != "completed" or report["evidence_gaps"]:
+            raise ReportIneligible("Incomplete investigation report")
         self._validate_report_evidence(conn, report)
         alerts = []
         for identifier in report["source_alert_ids"]:
@@ -58,41 +60,46 @@ class PreparationStore:
 
     def enqueue_case_preparation(self, investigation_id, target, *, max_attempts=3):
         """Freeze an eligible persisted report; identical identity retains its original budget."""
-        from soc_automation.cases import RENDERER_VERSION
-        from soc_automation.state import EvidenceConflict, StateError, _canonical_case_target
+        from soc_automation.state import _canonical_case_target
 
         _bound(max_attempts, 100)
         if not _canonical_case_target(target):
             raise ValueError("Canonical case target required")
         with self._connection() as conn:
             self._validate(conn)
-            row = conn.execute(
-                "SELECT * FROM investigations WHERE id=?", (investigation_id,),
-            ).fetchone()
-            if row is None:
-                raise StateError("Unknown investigation")
-            self._preparation_payload(conn, json.loads(row["report_json"]))
-            digest = hashlib.sha256(row["report_json"].encode()).hexdigest()
-            prior = conn.execute(
-                "SELECT * FROM case_preparation_jobs WHERE investigation_id=? AND target=? "
-                "AND renderer_version=? ORDER BY created_at,id LIMIT 1",
-                (investigation_id, target, RENDERER_VERSION),
-            ).fetchone()
-            if prior is not None:
-                if (prior["report_json"] != row["report_json"]
-                        or prior["evidence_fingerprint"] != row["evidence_fingerprint"]):
-                    raise EvidenceConflict("Preparation snapshot changed")
-                return self._preparation_row(conn, prior["id"])
-            identifier = str(uuid4())
-            conn.execute(
-                "INSERT INTO case_preparation_jobs(id,investigation_id,target,renderer_version,"
-                "report_json,report_sha256,evidence_fingerprint,created_at,"
-                "available_at,max_attempts) "
-                "VALUES(?,?,?,?,?,?,?,coordination_now(),coordination_now(),?)",
-                (identifier, investigation_id, target, RENDERER_VERSION, row["report_json"],
-                 digest, row["evidence_fingerprint"], max_attempts),
-            )
-            return self._preparation_row(conn, identifier)
+            return self._enqueue_case_preparation(conn, investigation_id, target, max_attempts)
+
+    def _enqueue_case_preparation(self, conn, investigation_id, target, max_attempts):
+        from soc_automation.cases import RENDERER_VERSION
+        from soc_automation.state import EvidenceConflict, StateError
+
+        row = conn.execute(
+            "SELECT * FROM investigations WHERE id=?", (investigation_id,),
+        ).fetchone()
+        if row is None:
+            raise StateError("Unknown investigation")
+        self._preparation_payload(conn, json.loads(row["report_json"]))
+        digest = hashlib.sha256(row["report_json"].encode()).hexdigest()
+        prior = conn.execute(
+            "SELECT * FROM case_preparation_jobs WHERE investigation_id=? AND target=? "
+            "AND renderer_version=? ORDER BY created_at,id LIMIT 1",
+            (investigation_id, target, RENDERER_VERSION),
+        ).fetchone()
+        if prior is not None:
+            if (prior["report_json"] != row["report_json"]
+                    or prior["evidence_fingerprint"] != row["evidence_fingerprint"]):
+                raise EvidenceConflict("Preparation snapshot changed")
+            return self._preparation_row(conn, prior["id"])
+        identifier = str(uuid4())
+        conn.execute(
+            "INSERT INTO case_preparation_jobs(id,investigation_id,target,renderer_version,"
+            "report_json,report_sha256,evidence_fingerprint,created_at,"
+            "available_at,max_attempts) "
+            "VALUES(?,?,?,?,?,?,?,coordination_now(),coordination_now(),?)",
+            (identifier, investigation_id, target, RENDERER_VERSION, row["report_json"],
+             digest, row["evidence_fingerprint"], max_attempts),
+        )
+        return self._preparation_row(conn, identifier)
 
     def claim_case_preparation(self, *, lease_seconds=60):
         """Claim one ready job with a new opaque owner token; return None when none is ready."""

@@ -10,6 +10,7 @@ from importlib.resources import files
 from pathlib import Path
 from uuid import uuid4
 
+from soc_automation.discovery import DiscoveryStore
 from soc_automation.preparation import PreparationStore
 
 TRANSITIONS = {
@@ -19,7 +20,7 @@ TRANSITIONS = {
     "completed": frozenset(),
     "failed": frozenset(),
 }
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class StateError(RuntimeError):
@@ -55,7 +56,11 @@ def _canonical_case_target(value):
         return False
 
 
-class Store(PreparationStore):
+class ReportEvidenceIneligible(StateError):
+    """An explicit mismatch against the persisted report evidence ledger."""
+
+
+class Store(DiscoveryStore, PreparationStore):
     def __init__(self, path: Path, timeout: int = 5):
         self.path = Path(path)
         self.timeout = timeout
@@ -119,6 +124,9 @@ class Store(PreparationStore):
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise StateError("Database must be initialized with a supported schema")
         expected = {
+            "case_preparation_discovery",
+            "discovery_transition",
+            "discovery_no_delete",
             "case_preparation_jobs",
             "case_preparation_ready",
             "case_preparation_publication",
@@ -565,7 +573,7 @@ class Store(PreparationStore):
             (report["investigation_id"],),
         ).fetchone()
         if row is None or row[0] != digest(report["retrieved_evidence"]):
-            raise StateError("Investigation snapshot mismatch")
+            raise ReportEvidenceIneligible("Investigation snapshot mismatch")
         for item in report["retrieved_evidence"]:
             if allow_gaps and item["status"] != "found":
                 continue
@@ -580,4 +588,4 @@ class Store(PreparationStore):
                 or saved[0] != item.get("sha256")
                 or saved[1] != encode(item.get("document"))
             ):
-                raise StateError("Stored evidence mismatch")
+                raise ReportEvidenceIneligible("Stored evidence mismatch")
