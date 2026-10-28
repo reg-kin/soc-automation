@@ -1,6 +1,5 @@
 """Transactional persistent state and migration ownership."""
 
-import hashlib
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -11,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from soc_automation.approval import ApprovalStore, ReviewPolicy
+from soc_automation.deadline import check_deadline, current_deadline, sha256_text
 from soc_automation.discovery import DiscoveryStore
 from soc_automation.preparation import PreparationStore
 from soc_automation.publication_review import PublicationReviewStore
@@ -81,34 +81,55 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
 
     @contextmanager
     def _connection(
-        self, *, create: bool = False, readonly: bool = False
+        self, *, create: bool = False, readonly: bool = False, deadline=None
     ) -> Iterator[sqlite3.Connection]:
         # URI mode=rw avoids creating an empty database on health checks or ordinary operations.
         target = self.path.as_uri() + (
             "?mode=rwc" if create else "?mode=ro" if readonly else "?mode=rw"
         )
-        connection = sqlite3.connect(target, uri=True, timeout=self.timeout, isolation_level=None)
+        check_deadline(deadline)
+        connection = sqlite3.connect(target, uri=True, timeout=0 if deadline is not None
+                                     else self.timeout, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.create_function("coordination_now", 0, time.time)
         connection.create_function(
             "sha256_text",
             1,
-            lambda value: hashlib.sha256(value.encode()).hexdigest(),
+            sha256_text,
             deterministic=True,
         )
         connection.create_function("canonical_case_target", 1, _canonical_case_target,
                                    deterministic=True)
+        token = current_deadline.set(deadline)
         try:
-            connection.execute("PRAGMA foreign_keys=ON")
-            connection.execute("PRAGMA synchronous=FULL")
-            connection.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
+            if deadline is not None:
+                connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+            def bounded(operation):
+                while True:
+                    check_deadline()
+                    try:
+                        return operation()
+                    except sqlite3.OperationalError as exc:
+                        if deadline is None or exc.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+                            raise
+                        check_deadline()
+                        time.sleep(min(0.005, max(0, deadline - time.monotonic())))
+
+            bounded(lambda: connection.execute("PRAGMA foreign_keys=ON"))
+            bounded(lambda: connection.execute("PRAGMA synchronous=FULL"))
+            bounded(lambda: connection.execute("BEGIN" if readonly else "BEGIN IMMEDIATE"))
+            check_deadline()
             yield connection
-            connection.commit()
+            bounded(connection.commit)
         except BaseException:
+            connection.set_progress_handler(None, 0)
             connection.rollback()
+            check_deadline()
             raise
         finally:
+            connection.set_progress_handler(None, 0)
             connection.close()
+            current_deadline.reset(token)
 
     def initialize(self) -> None:
         with self._connection(create=True) as connection:
@@ -426,6 +447,7 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
 
         snapshot = hashlib.sha256(encode(report["retrieved_evidence"]).encode()).hexdigest()
         for item in report["retrieved_evidence"]:
+            check_deadline()
             if item["status"] != "found":
                 continue
             ref = item["reference"]
@@ -603,6 +625,7 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
         if row is None or row[0] != digest(report["retrieved_evidence"]):
             raise ReportEvidenceIneligible("Investigation snapshot mismatch")
         for item in report["retrieved_evidence"]:
+            check_deadline()
             if allow_gaps and item["status"] != "found":
                 continue
             ref = item["reference"]

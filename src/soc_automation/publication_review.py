@@ -2,9 +2,10 @@
 
 import base64
 import binascii
-import hashlib
 import json
 import re
+
+from soc_automation.deadline import check_deadline, sha256_text
 
 REVIEW_STATUSES = ("unreviewed", "approved", "declined", "revoked")
 
@@ -12,13 +13,14 @@ REVIEW_STATUSES = ("unreviewed", "approved", "declined", "revoked")
 def _sha256(text):
     if not isinstance(text, str):
         raise ValueError("Stored text required")
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return sha256_text(text)
 
 
 def _object(text):
     def pairs(items):
         result = {}
         for key, value in items:
+            check_deadline()
             if key in result:
                 raise ValueError("Duplicate JSON key")
             result[key] = value
@@ -151,6 +153,7 @@ class PublicationReviewStore:
                 if encode(payload) != encode(expected):
                     raise ValueError("Deterministic payload mismatch")
             for job in preparations:
+                check_deadline()
                 if (job["report_json"] != report_text or job["report_sha256"] != report_hash
                         or job["investigation_id"] != row["investigation_id"]
                         or job["target"] != row["target"] or job["renderer_version"] != renderer
@@ -159,6 +162,7 @@ class PublicationReviewStore:
                     raise ValueError("Preparation binding mismatch")
             previous = None
             for event in history:
+                check_deadline()
                 if (event["previous_event_id"] != (previous["id"] if previous else None)
                         or event["payload_sha256"] != row["payload_sha256"]
                         or event["target"] != row["target"]

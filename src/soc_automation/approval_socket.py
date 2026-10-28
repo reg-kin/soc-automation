@@ -1,8 +1,9 @@
-"""Linux-only authenticated health transport. No approval mutation dispatch."""
+"""Linux-only authenticated health and durable decision transport."""
 
 import fcntl
 import json
 import os
+import re
 import socket
 import stat
 import struct
@@ -11,7 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from soc_automation.approval import TrustedIdentity, _uid
+from soc_automation.approval import REASONS, TrustedIdentity, _text, _uid
 from soc_automation.approval_policy import (
     PolicySource,
     _parts,
@@ -19,9 +20,10 @@ from soc_automation.approval_policy import (
     strict_object,
     verify_authority,
 )
-from soc_automation.state import Store
+from soc_automation.state import StateError, Store, _identifier
 
 REQUEST_LIMIT = 4096
+OPERATIONS = {"approve": "approved", "decline": "declined", "revoke": "revoked"}
 
 
 class AdmissionError(ValueError):
@@ -71,7 +73,9 @@ def peer_credentials(connection):
 def authorize_peer(credentials, policy, settings, *, operation, target):
     _, uid, _ = credentials
     principal = dict(policy.principals).get(uid)
-    if (principal is None or operation != 'health' or target not in policy.targets
+    if (principal is None or (operation != 'health'
+                            and OPERATIONS.get(operation) not in policy.decisions)
+            or target not in policy.targets
             or (uid in {0, settings.service_uid} and uid not in settings.special_uids)):
         raise AdmissionError('unauthorized')
     return TrustedIdentity.from_verified_peer_credentials(uid=uid, principal=principal)
@@ -80,20 +84,73 @@ def authorize_peer(credentials, policy, settings, *, operation, target):
 def validate_request(data):
     try:
         request = strict_object(data.decode('utf-8'))
-        if set(request) != {'version', 'operation', 'target'}:
-            raise ValueError
-        if type(request['version']) is not int:
+        if type(request.get('version')) is not int:
             raise ValueError
         if request['version'] != 1:
             raise AdmissionError('unsupported_version')
-        if (type(request['operation']) is not str or request['operation'] != 'health'
-                or type(request['target']) is not str):
+        operation = request.get('operation')
+        if type(operation) is not str or type(request.get('target')) is not str:
             raise ValueError
+        fields = {'version', 'operation', 'target'}
+        if operation in OPERATIONS:
+            fields |= {'request_id', 'publication_id', 'expected_state',
+                       'expected_previous_event_id', 'expected_payload_sha256',
+                       'expected_report_sha256', 'expected_renderer_version',
+                       'expected_review_policy_version', 'confirmed', 'reason_code'}
+        elif operation != 'health':
+            raise ValueError
+        if set(request) != fields:
+            raise ValueError
+        if operation in OPERATIONS:
+            for name in ('request_id', 'publication_id'):
+                if type(request[name]) is not str:
+                    raise ValueError
+                _identifier(request[name], 256)
+            if type(request['expected_state']) is not str:
+                raise ValueError
+            if request['expected_state'] != 'prepared':
+                raise AdmissionError('stale_publication_state')
+            if request['confirmed'] is not True:
+                raise ValueError
+            previous = request['expected_previous_event_id']
+            if previous is not None and (type(previous) is not int
+                                         or not 1 <= previous <= 2**63 - 1):
+                raise ValueError
+            for name in ('expected_payload_sha256', 'expected_report_sha256'):
+                if type(request[name]) is not str or not re.fullmatch('[0-9a-f]{64}',
+                                                                     request[name]):
+                    raise ValueError
+            for name in ('expected_renderer_version', 'expected_review_policy_version'):
+                _text(request[name])
+            reason = request['reason_code']
+            if reason is not None and (type(reason) is not str or reason not in REASONS):
+                raise ValueError
         return request
     except AdmissionError:
         raise
     except (ValueError, TypeError, UnicodeError, RecursionError):
         raise AdmissionError('invalid_request') from None
+
+
+def decision_error(error):
+    """Allowlisted engine failures only; never transmit exception text."""
+    return {
+        'Request ID conflict': 'conflicting_request_id',
+        'Trusted active policy unavailable or superseded': 'policy_unavailable',
+        'Authoritative active policy state corrupt or unavailable': 'policy_unavailable',
+        'Active review policy version mismatch': 'policy_unavailable',
+        'Current prepared publication head required': 'stale_publication_state',
+        'Stale publication binding': 'stale_publication_state',
+        'Unknown publication': 'stale_publication_state',
+        'Stale review predecessor': 'invalid_review_transition',
+        'Invalid decision transition': 'invalid_review_transition',
+        'Investigation snapshot mismatch': 'evidence_verification_failure',
+        'Stored evidence mismatch': 'evidence_verification_failure',
+        'Frozen publication integrity verification failed': 'evidence_verification_failure',
+        'Approval requires verified completed preparation provenance':
+            'evidence_verification_failure',
+        'Identity, target or decision unauthorized by active policy': 'unauthorized',
+    }.get(str(error), 'internal_failure')
 
 
 class ApprovalSocketService:
@@ -106,8 +163,7 @@ class ApprovalSocketService:
 
     def __init__(self, settings: SocketSettings, source: PolicySource, store):
         self.settings, self.source = settings, source
-        # Read-only admission checks have a short SQLite busy bound independent of
-        # the caller's persistence configuration. No mutation API is dispatched.
+        # Admission and decision transactions use a short SQLite busy bound.
         self.store = Store(store.path, timeout=min(0.1, settings.connection_seconds))
         self.policy = None
         self.listener = None
@@ -124,6 +180,8 @@ class ApprovalSocketService:
             raise ValueError('Service already started or closed')
         settings = self.settings
         self.policy = self.source.load(self.store)
+        self.store = Store(self.store.path, timeout=self.store.timeout,
+                           publication_policy=self.policy)
         try:
             self.directory = protected_directory(
                 settings.path.parent, {0, settings.administrator_uid, settings.service_uid})
@@ -191,8 +249,12 @@ class ApprovalSocketService:
         connection.sendall(struct.pack('!I', len(data)) + data)
 
     def _handle(self, connection, deadline):
+        request = {}
         try:
-            credentials = peer_credentials(connection)
+            try:
+                credentials = peer_credentials(connection)
+            except Exception:
+                raise AdmissionError('authentication_failure') from None
             size = struct.unpack('!I', self._read(connection, 4, deadline))[0]
             if not 1 <= size <= REQUEST_LIMIT:
                 raise AdmissionError('request_too_large')
@@ -201,19 +263,38 @@ class ApprovalSocketService:
             if connection.recv(1):
                 raise AdmissionError('invalid_request')
             request = validate_request(data)
-            authorize_peer(credentials, self.policy, self.settings,
-                           operation=request['operation'], target=request['target'])
+            identity = authorize_peer(credentials, self.policy, self.settings,
+                                      operation=request['operation'], target=request['target'])
             try:
                 verify_authority(self.store, self.policy, deadline=deadline)
+            except TimeoutError:
+                raise
             except Exception:
                 raise AdmissionError('policy_unavailable') from None
-            response = {'version': 1, 'ok': True, 'operation': 'health'}
+            if request['operation'] == 'health':
+                response = {'version': 1, 'ok': True, 'operation': 'health'}
+            else:
+                values = {key: value for key, value in request.items()
+                          if key not in {'version', 'operation', 'target', 'expected_state'}}
+                try:
+                    event = self.store.record_case_decision(
+                        identity=identity, policy=self.policy, deadline=deadline,
+                        decision=OPERATIONS[request['operation']],
+                        expected_target=request['target'], **values)
+                except ValueError:
+                    raise AdmissionError('invalid_request') from None
+                except StateError as exc:
+                    raise AdmissionError(decision_error(exc)) from None
+                response = {'version': 1, 'ok': True, 'event_id': event['id'],
+                            'outcome': event['decision'], 'historical': True}
         except TimeoutError:
             response = {'version': 1, 'ok': False, 'error': 'timeout'}
         except AdmissionError as exc:
             response = {'version': 1, 'ok': False, 'error': str(exc)}
         except Exception:
-            response = {'version': 1, 'ok': False, 'error': 'unavailable'}
+            response = {'version': 1, 'ok': False, 'error': 'unavailable'
+                        if request.get('operation') == 'health'
+                        else 'internal_failure'}
         try:
             # Reserve a bounded error-write window after an input timeout.
             self._respond(connection, response, min(deadline + 0.1, time.monotonic() + 0.1))

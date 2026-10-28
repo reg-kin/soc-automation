@@ -1,11 +1,10 @@
-# Local authenticated admission foundation (6.3B-2A)
+# Authenticated case approval operations (6.3B-2B)
 
-This stage supplies tested Linux library code for protected policy loading and an
-AF_UNIX health endpoint. It does **not** supply a production approval command,
-production service installation, approval mutation dispatch, publication,
-reconciliation, remediation, or an administrative socket endpoint. Existing
-persistence and publication guards remain in place. See
-[internal approval persistence](internal-approval.md) for the schema 10 contract.
+The Linux AF_UNIX service supports health, approve, decline and revoke through
+schema 10's existing decision engine. Approval records authorization; it does not
+publish a case. There is no publication, reconciliation, remediation, policy
+administration, operator CLI or production service installation in this milestone.
+See [internal approval persistence](internal-approval.md).
 
 ## Trust boundary and accounts
 
@@ -20,9 +19,9 @@ Use a dedicated service account, a separate administrator (normally UID 0), and
 an operator group. Operators must have distinct Unix UIDs that map to stable
 principal names in `ReviewPolicy.principals`. Numeric UID membership is necessary;
 Unix group membership alone grants no application authority. The group permits
-reaching the socket, while the policy permits the one `health` operation for its
-listed targets. Review decisions in `ReviewPolicy.decisions` retain their existing
-meaning and do not enable transport operations. All other operations are rejected.
+reaching the socket, while the policy permits health on its listed targets and the decision operations
+mapped to its `decisions`: approve → approved, decline → declined, revoke → revoked.
+All other operations are rejected.
 
 Kernel `SO_PEERCRED` supplies PID, UID, and GID from each accepted stream. Only the
 numeric UID selects a principal. PID/GID are obtained but do not grant authority.
@@ -74,7 +73,7 @@ trusted; this is not protection from a malicious administrator.
 The policy is a complete JSON encoding of the existing `ReviewPolicy` fields;
 [the example](../deploy/approval-policy.example.json) contains an effective
 placeholder grant: UID 10001 maps to `example:operator` and can authenticate for
-health on the example target (subject to the root/service UID restrictions).
+health and decisions on the example target (subject to the root/service UID restrictions).
 The existing schema requires at least one UID mapping, so this is not a
 deny-by-default policy. Replace this grant with reviewed operator UIDs and
 principals, and replace the target and version before installation. Never install
@@ -103,8 +102,8 @@ with database write access. The loader verifies ledger consistency; it does not
 cryptographically authenticate a database against a writer who can forge the
 entire ledger. Existing schema validation checks required schema objects, not
 maliciously rewritten trigger bodies. Publication and approval persistence retain
-their existing independent checks; this endpoint calls neither. A future mutation
-adapter must recheck authority inside the existing atomic decision transaction.
+their existing independent checks. Decisions recheck authority inside the existing
+atomic decision transaction.
 
 ## Explicit administrative installation and rotation
 
@@ -170,11 +169,11 @@ unconditional unlink or policy adoption.
 
 The default concurrency limit is eight active handlers (configurable 1–64);
 excess accepted clients receive `busy` and close. The kernel backlog is bounded
-by the same setting. Each accepted request has a monotonic total read deadline
+by the same setting. Each accepted request has a monotonic total request deadline
 (default two seconds; configurable 0.05–30), so drip-fed bytes do not reset it.
 Writes have a maximum 0.1-second window, including a small window after an input
-timeout for its error response. Read-only SQLite checks use a busy timeout no
-larger than 0.1 seconds and a deadline progress handler. Host scheduling and
+timeout for its error response. SQLite admission and decision checks disable native
+busy waiting and use deadline-aware lock retries and a deadline progress handler. Host scheduling and
 filesystem stalls are not hard real-time bounded. Apply supervisor process and
 resource limits in deployment. These controls limit resource use; authorized
 local clients can still deny service by repeatedly filling all slots.
@@ -192,49 +191,142 @@ outbound network call. Each connection carries exactly one request:
 {"version":1,"operation":"health","target":"https://example.test/default/securitySolution"}
 ```
 
-Exactly those three fields are required. The version is an integer, not a bool;
-operation and target are strings. Only `health` is accepted, and the target must
-belong to the active policy. No client identity fields or additional operations
-are accepted. All JSON strictness rules above apply. Responses use the same
-four-byte length framing, followed by one deterministic JSON object; the server
-closes the stream. Success has no principal, policy content, paths, or database
-information:
+Health requires exactly those three fields and preserves its existing response:
+`{"ok":true,"operation":"health","version":1}`.
+
+Decisions require exactly the following fields; substitute `decline` or `revoke`
+for `approve` as appropriate:
 
 ```json
-{"ok":true,"operation":"health","version":1}
+{
+  "version": 1,
+  "operation": "approve",
+  "target": "https://example.test/default/securitySolution",
+  "request_id": "operator-intent-unique-1",
+  "publication_id": "exact-publication-id",
+  "expected_state": "prepared",
+  "expected_previous_event_id": null,
+  "expected_payload_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expected_report_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "expected_renderer_version": "soc-case/2",
+  "expected_review_policy_version": "review/1",
+  "confirmed": true,
+  "reason_code": null
+}
 ```
 
-Errors contain `version: 1`, `ok: false`, and one stable `error` code:
-`invalid_request`, `unsupported_version`, `request_too_large`, `truncated_request`,
-`unauthorized`, `timeout`, `busy`, `policy_unavailable`, or `unavailable`.
-Malformed shape/JSON is rejected before authorization; a validly shaped unknown
-UID or unauthorized target gets `unauthorized`. Internal exception text is never
-sent. For timeout, disconnected, or nonreading clients, delivery of an error
-cannot be guaranteed. A client must treat missing/truncated responses as failure.
+All fields are mandatory, including explicit null predecessor and reason when
+appropriate. Identifiers are nonblank strings of at most 256 characters with no
+characters below U+0020. Hashes are exactly 64 lowercase hexadecimal characters.
+The predecessor is null initially, otherwise an integer from 1 through 2^63−1;
+bools are rejected. Renderer and review version are existing engine tokens of
+1–256 ASCII letters/digits and `:._/-`, starting with a letter/digit. State must
+be the literal `prepared`; other strings return `stale_publication_state`.
+Confirmation must be the boolean true. Version is integer 1. Operation and target
+are strings. Unknown fields, identity/authority claims, payloads, unsupported types,
+duplicate keys, floats and nonfinite constants are rejected. The 4096-byte limit
+and one-request framing remain unchanged.
 
-## Tested scope and remaining work
+Reason is null or an existing bounded reason code: `operator_declined`,
+`operator_revoked`, `incorrect_payload`, `policy`. New decisions must use a code
+allowed by the installed policy for that outcome; an empty reason set requires
+null. Default approval requires null, decline requires `operator_declined`,
+`incorrect_payload` or `policy`, and revoke requires `operator_revoked`,
+`incorrect_payload` or `policy`. No free-form reason text is accepted.
 
-Offline tests use real Linux AF_UNIX streams and SO_PEERCRED under the test UID,
-private temporary directories, synthetic policy, and temporary SQLite databases.
-They test file/path attacks, strict parsing/framing, authorization and default
-root/service denials, authority corruption/rotation, listener locking and
-replacement, timeouts, concurrency, shutdown, and unchanged database contents.
-Root and differing UID cases use synthetic credential tuples as well as actual
-same-UID transport denials; tests do not require root or create OS accounts.
-Only explicitly marked tests may create AF_UNIX stream sockets. IP sockets,
-connection helpers, and DNS remain blocked. No Elasticsearch or Kibana is used.
+Obtain exact bindings through the trusted offline publication review workflow.
+The engine verifies frozen payload, report, evidence ledger, renderer, current
+prepared head and predecessor in its transaction. Approval additionally requires
+verified completed preparation provenance. Decline/revoke accept verified evidence
+under their existing policy. Initially or after decline/revocation, approve or
+decline is allowed. After approval only revoke is allowed. Published, sending,
+uncertain and superseded records cannot receive new decisions.
 
-Account provisioning, actual multi-account group access, ACL/LSM behavior,
-namespace/UID mapping, supervisor hardening, administrator authentication,
-backup integrity, and production filesystem/procfs availability are deployment
-assumptions, not certified by these tests. ACLs, Linux capabilities, root, and
-service-account compromise remain part of the host trust boundary. Do not grant
-operators directory write access through ACLs or capabilities. No production
-deployment is claimed complete.
+A successful decision response has exactly these fields:
 
-6.3B-2B still needs an explicitly scoped approval request contract, authenticated
-intent and stale-state bindings, dispatch to the existing atomic persistence API,
-response/retry semantics, and corresponding end-to-end security tests. An
-operator client/CLI and production service composition need separate design and
-review. This stage adds no approval, decline, revocation, publication, policy
-administration, arbitrary database, or remediation dispatch.
+```json
+{"version":1,"ok":true,"event_id":1,"outcome":"approved","historical":true}
+```
+
+`event_id` is the durable positive review event ID; outcome is `approved`,
+`declined` or `revoked`. Every result describes a recorded historical event,
+including the first response. It never asserts current effective approval.
+No evidence, identity, timestamps or policy contents are returned.
+
+Every request obtains SO_PEERCRED, resolves UID using the retained trusted policy,
+and authorizes the operation and target before mutation. Only then is
+TrustedIdentity constructed. Full authoritative ledger verification precedes dispatch;
+the Store rechecks the exact active generation in its BEGIN IMMEDIATE transaction.
+Rotation and decisions serialize on the same SQLite writer lock. If rotation wins,
+stale authority cannot persist a decision. If the decision wins, its event remains
+auditable after rotation. Restart with matching protected policy after rotation;
+there is no implicit adoption or installation. Existing root/service exclusions
+and trusted test-only exception composition remain unchanged; no new override exists.
+
+The globally unique request ID binds the engine's full immutable intent. Exact
+authorized replay returns the original event without another write, even after
+revocation or publication state changes. It skips current eligibility checks;
+the required `prepared` expectation describes the original intent. Conflicting
+reuse returns `conflicting_request_id`. A current retained authority is always
+required, even for replay. After restart under a rotated policy, authorized
+historical replay may retain the original expected review policy version.
+
+Commit completes before response writing. A disconnected client or failed response
+write does not undo it. No automatic retries occur. On a missing/truncated response,
+retry the identical intent with the same request ID to discover the historical
+outcome; do not generate a new ID merely because delivery failed.
+
+Errors have exactly `version:1`, `ok:false`, and a stable `error` string:
+
+| Code | Meaning |
+| --- | --- |
+| `authentication_failure` | Kernel peer credentials unavailable/invalid |
+| `unauthorized` | UID, special UID, operation or target denied |
+| `invalid_request` | Invalid JSON, fields, types, confirmation or reason |
+| `policy_unavailable` | Missing, invalid, superseded or mismatched policy authority |
+| `stale_publication_state` | Wrong state, head, publication or artifact binding |
+| `conflicting_request_id` | Existing request has different intent |
+| `invalid_review_transition` | Stale predecessor or disallowed transition |
+| `evidence_verification_failure` | Corrupt artifacts/evidence or missing approval provenance |
+| `internal_failure` | Other decision/internal failure, including database contention |
+
+Existing framing/admission codes remain `unsupported_version`, `request_too_large`,
+`truncated_request`, `timeout`, `busy`; health retains generic `unavailable`.
+No exception text, SQL, paths, secrets or tracebacks are transmitted. Error delivery
+cannot be guaranteed. An internal failure is not permission to change the intent.
+
+Offline tests use synthetic SQLite and temporary real AF_UNIX sockets. IP sockets
+and DNS remain blocked. Coverage includes strict admission, all decisions, replay,
+conflicts, predecessor/state/hash guards, evidence and provenance, concurrent heads,
+rotation ordering, and response loss after commit. No Kibana or remediation call
+is dispatched; decision persistence only adds a review event.
+
+Remaining limitations include account provisioning, distinct-account access,
+ACL/LSM and capability enforcement, UID namespaces/recycling, descriptor passing,
+recent human authentication, supervisor hardening, administrator authentication,
+backup integrity and production procfs availability. Authorized account compromise
+can exercise that account's policy. Database writers and trusted in-process code
+remain privileged. Checksums do not defend against a writer rewriting every binding.
+No production deployment is certified. The example UID 10001 grant is effective
+and must be replaced before deployment. Operator CLI and production composition
+remain separate work.
+
+Decision execution uses the same absolute monotonic deadline established when
+accepting the connection; admission and database delays never renew it. The durable
+decision API checks expiry before and after acquiring the writer lock, during
+policy/evidence verification and chunked hashing, and immediately before COMMIT.
+SQLite VM work has a progress handler; writer acquisition retries without a SQLite
+busy wait, checking the remaining budget. Expiry before commit rolls back the whole
+transaction, including any inserted review event, and returns the sanitized `timeout`
+error when the response can still be delivered. Connection handlers are removed
+and transaction context is reset on every exit.
+
+This is a cooperative execution deadline, not a hard real-time completion bound.
+Filesystem/kernel calls, JSON parsing/serialization, individual native operations,
+and COMMIT/fsync cannot safely be interrupted. After such verification work returns,
+expiry prevents commit. A COMMIT started within the deadline can finish after it;
+its durable outcome must be treated as committed. No asynchronous thread cancellation
+is used. Response delivery can time out or the client can disconnect after commit.
+Retry the exact original intent with its original request ID: an authorized exact
+replay returns the existing event without adding an event or changing the review
+head. Current UID, operation and target authorization still apply to every retry.

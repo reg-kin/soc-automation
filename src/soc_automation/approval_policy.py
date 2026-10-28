@@ -138,7 +138,7 @@ class PolicySource:
 def verify_authority(store, policy, *, deadline=None):
     """Read-only snapshot; validate *all* ledger semantics, then exact active content."""
     try:
-        with store._connection(readonly=True) as conn:
+        with store._connection(readonly=True, deadline=deadline) as conn:
             if deadline is not None:
                 conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
             store._validate(conn)
@@ -164,5 +164,7 @@ def verify_authority(store, policy, *, deadline=None):
                 versions.add(candidate.version)
             if active is None or active['content'] != _policy_content(policy):
                 raise ValueError('Missing or superseded authority')
+    except TimeoutError:
+        raise
     except Exception as exc:
         raise StateError('Policy authority unavailable') from exc

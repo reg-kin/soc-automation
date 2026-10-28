@@ -1,10 +1,11 @@
 """Internal trusted decision boundary. No authentication, policy loader or transport."""
 
-import hashlib
 import json
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
+
+from soc_automation.deadline import check_deadline, sha256_text
 
 DECISIONS = frozenset({'approved', 'declined', 'revoked'})
 REASONS = frozenset({'operator_declined', 'operator_revoked', 'incorrect_payload', 'policy'})
@@ -142,6 +143,7 @@ class ReviewPolicy:
 def _policy_content(policy):
     """Canonical complete immutable semantics, including the non-reusable version."""
     def canonical(value):
+        check_deadline()
         if isinstance(value, frozenset):
             return sorted(canonical(item) for item in value)
         if isinstance(value, tuple):
@@ -163,9 +165,10 @@ class ApprovalStore:
                 'SELECT * FROM review_policy_generations ORDER BY generation'
             ).fetchall()
             for generation, row in enumerate(rows, 1):
+                check_deadline()
                 content = row['content']
                 if (row['generation'] != generation
-                        or hashlib.sha256(content.encode()).hexdigest() != row['content_sha256']
+                        or sha256_text(content) != row['content_sha256']
                         or json.loads(content)['version'] != row['version']):
                     raise ValueError('Invalid policy ledger')
             return rows[-1] if rows else None
@@ -200,7 +203,7 @@ class ApprovalStore:
             generation = 1 if active is None else active['generation'] + 1
             conn.execute('INSERT INTO review_policy_generations VALUES(?,?,?,?,?)',
                          (generation, policy.version, content,
-                          hashlib.sha256(content.encode()).hexdigest(), _timestamp()))
+                          sha256_text(content), _timestamp()))
         return generation
 
     def _require_active_policy(self, conn):
@@ -217,7 +220,7 @@ class ApprovalStore:
         self, *, identity, policy, request_id, publication_id, decision,
         expected_previous_event_id, expected_payload_sha256, expected_report_sha256,
         expected_target, expected_renderer_version, expected_review_policy_version,
-        confirmed, reason_code=None,
+        confirmed, reason_code=None, deadline=None,
     ):
         """Record one explicit intent, or return its historical committed replay.
 
@@ -226,6 +229,7 @@ class ApprovalStore:
         """
         from soc_automation.state import StateError, _canonical_case_target, _identifier, _timestamp
 
+        check_deadline(deadline)
         if type(policy) is not ReviewPolicy or policy is not self._publication_policy:
             raise StateError('Trusted active policy required')
         _identifier(request_id, 256)
@@ -246,6 +250,7 @@ class ApprovalStore:
         if reason_code is not None and (type(reason_code) is not str or reason_code not in REASONS):
             raise ValueError('Invalid reason')
         policy.authorize(identity, target=expected_target, decision=decision)
+        check_deadline(deadline)
         intent = dict(
             request_id=request_id, publication_id=publication_id, decision=decision,
             previous_event_id=expected_previous_event_id, payload_sha256=expected_payload_sha256,
@@ -256,7 +261,7 @@ class ApprovalStore:
             authentication_method=identity.authentication_method,
             reason_code=reason_code,
         )
-        with self._connection() as conn:
+        with self._connection(deadline=deadline) as conn:
             self._validate(conn)
             self._require_active_policy(conn)
             prior = conn.execute('SELECT * FROM case_review_events WHERE request_id=?',

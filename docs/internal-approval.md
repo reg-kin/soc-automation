@@ -1,8 +1,8 @@
 # Internal approval persistence (Milestone 6.3B-1)
 
-The persistence contract below is preserved. The subsequent 6.3B-2A protected
-loader and authenticated health transport are documented in
-[local authenticated admission](approval-socket.md); neither dispatches decisions.
+The persistence contract below is preserved. Milestones 6.3B-2A/2B add the
+protected policy loader and authenticated health and decision transport documented
+in [authenticated approval operations](approval-socket.md).
 
 Schema 10 adds an initially empty, append-only policy-generation ledger to schema 9.
 Migration installs no policy and grants no authority. Approval records remain append-only,
@@ -138,8 +138,7 @@ need a new claim and never enables a resend.
 
 A default Store has no active policy and fails closed on any otherwise eligible
 claim. Consequently the ordinary production CLI cannot initiate publication in
-this stage, even if a durable approval was manually inserted. Approval mutation
-dispatch remains for 6.3B-2B; no permissive default, policy label argument or environment override bypass exists. Already published results
+this stage, even if a durable approval was manually inserted. Authenticated socket decision dispatch is available in 6.3B-2B; no permissive default, policy label argument or environment override bypass exists. Already published results
 and uncertain-outcome reconciliation preserve their existing behavior.
 
 Historical schema/service tests use `tests.review_helpers.LegacyClaimStore`, an
@@ -151,11 +150,29 @@ covers the full new gate and manual publication with valid preparation and polic
 
 ## Remaining boundaries
 
-The subsequent 6.3B-2A adds protected loading and kernel-authenticated Unix socket
-health admission. Approval mutation dispatch, policy deployment integration, CLI
-decision operations, automatic publication, and remediation remain absent. There
+Milestones 6.3B-2A/2B add protected policy loading and kernel-authenticated Unix
+socket health and decision operations; see [the protocol](approval-socket.md).
+Approval records authorization; it does not publish a case. Policy deployment
+integration, operator CLI, automatic publication and remediation remain absent.
+The example UID 10001 grant is effective and must be replaced before deployment. There
 is no new runtime dependency or production infrastructure change. Deployment
 ownership and permissions remain administrative responsibilities. Checksums detect stored
 inconsistency; they do not authenticate a database against an actor able to rewrite
 all artifacts and bindings. Publication credentials and the production assurance
 platform remain operationally separate from approval decisions.
+
+`Store.record_case_decision(..., deadline=None)` accepts an optional absolute
+`time.monotonic()` deadline. Existing trusted callers may omit it; the authenticated
+socket always passes its original accept-time deadline, shared with admission.
+The transaction checks expiry before and after writer acquisition, cooperatively
+through policy/evidence loops and hashing, through a SQLite progress handler, and
+immediately before COMMIT. Any observed expiry before COMMIT rolls back all decision
+writes. Progress handlers and context-local deadline state are cleaned up on exit.
+
+This guarantee bounds cooperative execution, not kernel or filesystem latency.
+Native JSON operations and other indivisible calls may overrun; their return is
+followed by deadline checks and rollback before commit. COMMIT/fsync itself cannot
+safely be interrupted: a commit begun before expiry may complete afterward. A client
+may time out after a successful commit. Retry the unchanged request with its original
+request ID to recover the committed historical event, subject to current authorization,
+without a new event or review-head mutation. No thread is asynchronously cancelled.

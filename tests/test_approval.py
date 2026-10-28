@@ -585,3 +585,109 @@ def test_concurrent_rotation_has_single_winner(context):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(rotate, ['review/2', 'review/3']))
     assert sorted(results, key=str) == [2, 'conflict']
+
+
+@pytest.mark.parametrize('stage', ['python', 'sqlite', 'lock', 'precommit', 'entry'])
+def test_decision_deadline_rollback(context, monkeypatch, stage):
+    from soc_automation import deadline
+
+    store = context[0]
+    values = request(context)
+    before = snapshot(store)
+    clock = [10.0]
+    monkeypatch.setattr(deadline.time, 'monotonic', lambda: clock[0])
+    if stage == 'entry':
+        clock[0] = 20.0
+    elif stage == 'python':
+        original = store._validate_report_evidence
+
+        def verify(*args, **kwargs):
+            clock[0] = 20.0
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store, '_validate_report_evidence', verify)
+    elif stage == 'sqlite':
+        original = store._verify_case_publication
+
+        def verify(conn, publication_id):
+            clock[0] = 20.0
+            conn.execute('WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL '
+                         'SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n').fetchone()
+            return original(conn, publication_id)
+
+        monkeypatch.setattr(store, '_verify_case_publication', verify)
+    elif stage == 'precommit':
+        from contextlib import contextmanager
+
+        original_connection = store._connection
+
+        @contextmanager
+        def expire_before_commit(**kwargs):
+            with original_connection(**kwargs) as conn:
+                yield conn
+                assert conn.execute('SELECT count(*) FROM case_review_events').fetchone()[0] == 1
+                clock[0] = 20.0
+
+        monkeypatch.setattr(store, '_connection', expire_before_commit)
+    else:
+        blocker = sqlite3.connect(store.path, isolation_level=None)
+        blocker.execute('BEGIN IMMEDIATE')
+        monkeypatch.setattr(deadline.time, 'sleep', lambda _: clock.__setitem__(0, 20.0))
+    try:
+        with pytest.raises(TimeoutError):
+            store.record_case_decision(**values, deadline=15.0)
+    finally:
+        if stage == 'lock':
+            blocker.rollback()
+            blocker.close()
+    if stage == 'precommit':
+        monkeypatch.setattr(store, '_connection', original_connection)
+    assert snapshot(store) == before
+    assert count(store) == 0
+    assert deadline.current_deadline.get() is None
+
+
+def test_decision_deadline_success_and_lost_response_replay(context):
+    import time
+
+    store = context[0]
+    values = request(context)
+    event = store.record_case_decision(**values, deadline=time.monotonic() + 30)
+    before = snapshot(store)
+    assert store.record_case_decision(**values, deadline=time.monotonic() + 30) == event
+    assert snapshot(store) == before
+
+
+def test_exact_binding_with_two_authorized_targets(context):
+    store, policy, *_ = context
+    other = 'https://other.test/default/securitySolution'
+    policy = replace(policy, version='review/2', targets=frozenset({TARGET, other}))
+    store.install_review_policy(policy, expected_generation=1)
+    store._publication_policy = policy
+    values = request(context, policy=policy, expected_review_policy_version=policy.version,
+                     expected_target=other)
+    before = snapshot(store)
+    with pytest.raises(StateError, match='binding'):
+        store.record_case_decision(**values)
+    assert snapshot(store) == before
+
+
+@pytest.mark.parametrize('loss', ['uid', 'operation', 'target'])
+def test_exact_replay_requires_current_authorization(context, loss):
+    store, policy, *_ = context
+    values = request(context)
+    store.record_case_decision(**values)
+    changes = dict(version='review/2')
+    if loss == 'uid':
+        changes['principals'] = ((1001, 'other'),)
+    elif loss == 'operation':
+        changes['decisions'] = frozenset({'declined', 'revoked'})
+    else:
+        changes['targets'] = frozenset({'https://other.test/default/securitySolution'})
+    policy = replace(policy, **changes)
+    store.install_review_policy(policy, expected_generation=1)
+    store._publication_policy = policy
+    before = snapshot(store)
+    with pytest.raises(StateError, match='unauthorized'):
+        store.record_case_decision(**dict(values, policy=policy))
+    assert snapshot(store) == before

@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from test_preparation import queue as preparation_queue
 
 from soc_automation.approval import ReviewPolicy, _policy_content
 from soc_automation.approval_policy import POLICY_LIMIT, PolicySource, verify_authority
@@ -611,3 +612,274 @@ def test_example_policy_placeholder_grant(setup):
         authorize_peer((1, 10003, 123), policy, settings, operation='health', target=target)
     with pytest.raises(ValueError, match='UID/principal mapping required'):
         replace(policy, principals=())
+
+
+@pytest.fixture
+def decisions(setup, request):
+    root, policy, source, _, settings = setup
+    store, report, payload = preparation_queue.__wrapped__(root)
+    store.install_review_policy(policy, expected_generation=None)
+    if getattr(request, 'param', True):
+        job = store.enqueue_case_preparation(report['investigation_id'], TARGET)
+        lease = store.claim_case_preparation()
+        done = store.complete_case_preparation(job['id'], lease['lease_owner'],
+                                               lease['lease_generation'], payload=payload)
+    else:
+        publication = store.prepare_publication(report['investigation_id'], TARGET, payload)
+        done = {'publication_id': publication['id']}
+    service = ApprovalSocketService(settings, source, store).start()
+    thread = threading.Thread(target=service.serve_forever)
+    thread.start()
+    review = store.review_case_publication(done['publication_id'])
+    request = dict(version=1, operation='approve', target=TARGET, request_id='intent-1',
+                   publication_id=done['publication_id'], expected_state='prepared',
+                   expected_previous_event_id=None,
+                   expected_payload_sha256=review['payload_sha256'],
+                   expected_report_sha256=review['report_sha256'],
+                   expected_renderer_version=review['renderer_version'],
+                   expected_review_policy_version=policy.version, confirmed=True, reason_code=None)
+    try:
+        yield service, store, request, report, payload
+    finally:
+        service.close()
+        thread.join(2)
+        assert not thread.is_alive()
+
+
+def event_count(store):
+    with store._connection(readonly=True) as conn:
+        return conn.execute('SELECT count(*) FROM case_review_events').fetchone()[0]
+
+
+def test_authenticated_decisions_and_historical_replays(decisions):
+    service, store, request, _, _ = decisions
+    with store._connection(readonly=True) as conn:
+        before = list(conn.iterdump())
+    approved = exchange(service, request)
+    assert approved == dict(version=1, ok=True, event_id=1, outcome='approved', historical=True)
+    assert exchange(service, request) == approved
+    revoke = dict(request, operation='revoke', request_id='intent-2',
+                  expected_previous_event_id=1, reason_code='operator_revoked')
+    assert exchange(service, revoke)['outcome'] == 'revoked'
+    assert exchange(service, request) == approved
+    decline = dict(request, operation='decline', request_id='intent-3',
+                   expected_previous_event_id=2, reason_code='operator_declined')
+    assert exchange(service, decline)['outcome'] == 'declined'
+    assert event_count(store) == 3
+    with store._connection(readonly=True) as conn:
+        after = list(conn.iterdump())
+    assert all(line in after for line in before)
+    assert all(line.startswith('INSERT INTO "case_review_events"')
+               for line in after if line not in before)
+    with store._connection(readonly=True) as conn:
+        assert conn.execute('SELECT state FROM case_publications').fetchone()[0] == 'prepared'
+        assert conn.execute('SELECT count(*) FROM case_publication_audit').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('change,error', [
+    ({'request_id': None}, 'invalid_request'), ({'request_id': ''}, 'invalid_request'),
+    ({'request_id': 'x' * 257}, 'invalid_request'), ({'request_id': '\n'}, 'invalid_request'),
+    ({'expected_state': None}, 'invalid_request'),
+    ({'expected_state': 'sending'}, 'stale_publication_state'),
+    ({'expected_payload_sha256': 'a' * 64}, 'stale_publication_state'),
+    ({'expected_report_sha256': 'a' * 64}, 'stale_publication_state'),
+    ({'expected_previous_event_id': 42}, 'invalid_review_transition'),
+    ({'expected_previous_event_id': True}, 'invalid_request'),
+    ({'confirmed': 1}, 'invalid_request'), ({'confirmed': False}, 'invalid_request'),
+    ({'actor_uid': 0}, 'invalid_request'), ({'principal': 'root'}, 'invalid_request'),
+    ({'authentication_method': 'os_peer_credentials'}, 'invalid_request'),
+    ({'policy': {}}, 'invalid_request'), ({'payload': {}}, 'invalid_request'),
+    ({'operation': 'revoke', 'reason_code': 'operator_revoked'}, 'invalid_review_transition'),
+    ({'operation': 'decline'}, 'invalid_request'),
+    ({'target': 'https://other.test/default/securitySolution'}, 'unauthorized'),
+])
+def test_decision_rejections(decisions, change, error):
+    service, store, request, _, _ = decisions
+    assert exchange(service, dict(request, **change)) == dict(version=1, ok=False, error=error)
+    assert event_count(store) == 0
+
+
+@pytest.mark.parametrize('field', ['request_id', 'expected_state', 'expected_previous_event_id',
+                                   'expected_report_sha256', 'confirmed'])
+def test_missing_decision_fields(decisions, field):
+    service, store, request, _, _ = decisions
+    del request[field]
+    assert exchange(service, request)['error'] == 'invalid_request'
+    assert event_count(store) == 0
+
+
+def test_decision_conflict_and_replay_after_state_change(decisions):
+    service, store, request, _, _ = decisions
+    event = exchange(service, request)
+    conflict = exchange(service, dict(request, reason_code='policy'))
+    assert conflict['error'] == 'conflicting_request_id'
+    assert service.store.claim_publication(request['publication_id'],
+                                           request['expected_payload_sha256'])
+    assert exchange(service, request) == event
+    assert exchange(service, dict(request, request_id='new'))['error'] == 'stale_publication_state'
+    assert event_count(store) == 1
+
+
+def test_concurrent_socket_decisions(decisions):
+    from concurrent.futures import ThreadPoolExecutor
+
+    service, store, request, _, _ = decisions
+    other = dict(request, request_id='other', operation='decline', reason_code='operator_declined')
+    with ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(lambda value: exchange(service, value), [request, other]))
+    assert sum(result['ok'] for result in results) == 1
+    assert {result.get('error') for result in results} == {None, 'invalid_review_transition'}
+    assert event_count(store) == 1
+
+
+def test_rotation_between_admission_and_decision(decisions, monkeypatch):
+    service, store, request, _, _ = decisions
+    original = service.store.record_case_decision
+
+    def rotate(**values):
+        store.install_review_policy(replace(service.policy, version='review/2'),
+                                    expected_generation=1)
+        return original(**values)
+
+    monkeypatch.setattr(service.store, 'record_case_decision', rotate)
+    assert exchange(service, request)['error'] == 'policy_unavailable'
+    assert event_count(store) == 0
+    assert exchange(service, request)['error'] == 'policy_unavailable'
+
+
+def test_rotation_waits_for_decision_transaction(decisions, monkeypatch):
+    service, store, request, _, _ = decisions
+    entered, release = threading.Event(), threading.Event()
+    original = service.store._verify_case_publication
+
+    def paused(*args):
+        entered.set()
+        assert release.wait(2)
+        return original(*args)
+
+    monkeypatch.setattr(service.store, '_verify_case_publication', paused)
+    result = []
+    client = threading.Thread(target=lambda: result.append(exchange(service, request)))
+    client.start()
+    assert entered.wait(1)
+    rotated = []
+    admin = Store(store.path, timeout=2)
+    rotation = threading.Thread(target=lambda: rotated.append(admin.install_review_policy(
+        replace(service.policy, version='review/2'), expected_generation=1)))
+    rotation.start()
+    release.set()
+    client.join(2)
+    rotation.join(2)
+    assert result[0]['ok'] and rotated == [2]
+    assert event_count(store) == 1
+    assert exchange(service, request)['error'] == 'policy_unavailable'
+
+
+@pytest.mark.parametrize('failure', [BrokenPipeError, TimeoutError])
+def test_disconnect_after_commit_and_safe_retry(decisions, monkeypatch, failure):
+    service, store, request, _, _ = decisions
+    committed = threading.Event()
+    original = service._respond
+
+    def lost_response(*args):
+        committed.set()
+        raise failure
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service, '_respond', lost_response)
+        encoded = json.dumps(request).encode()
+        with connect(service) as client:
+            client.sendall(struct.pack('!I', len(encoded)) + encoded)
+            client.shutdown(socket.SHUT_WR)
+            assert committed.wait(1)
+    monkeypatch.setattr(service, '_respond', original)
+    assert exchange(service, request)['event_id'] == 1
+    assert event_count(store) == 1
+
+
+def test_decision_errors_are_sanitized(decisions, monkeypatch):
+    service, store, request, _, _ = decisions
+
+    def fail(**kwargs):
+        raise StateError('SQL secret /private/file traceback')
+
+    monkeypatch.setattr(service.store, 'record_case_decision', fail)
+    assert exchange(service, request) == dict(version=1, ok=False, error='internal_failure')
+    assert event_count(store) == 0
+
+
+def test_corrupt_evidence(decisions):
+    service, store, request, report, payload = decisions
+    with store._connection() as conn:
+        triggers = conn.execute("SELECT sql,name FROM sqlite_master WHERE type='trigger' "
+                                "AND tbl_name='investigation_evidence'").fetchall()
+        for row in triggers:
+            conn.execute('DROP TRIGGER "' + row['name'] + '"')
+        conn.execute("UPDATE investigation_evidence SET original_json='{}'")
+        for row in triggers:
+            conn.execute(row['sql'])
+    assert exchange(service, request)['error'] == 'evidence_verification_failure'
+    assert event_count(store) == 0
+
+
+@pytest.mark.parametrize('decisions', [False], indirect=True)
+def test_approval_requires_completed_preparation(decisions):
+    service, store, request, _, _ = decisions
+    assert exchange(service, request)['error'] == 'evidence_verification_failure'
+    assert exchange(service, dict(request, operation='decline',
+                                  reason_code='operator_declined'))['outcome'] == 'declined'
+    assert event_count(store) == 1
+
+
+@pytest.mark.parametrize('change', ['uid', 'operation'])
+def test_decision_peer_authorization(decisions, change):
+    service, store, request, _, _ = decisions
+    if change == 'uid':
+        service.policy = replace(service.policy, principals=((os.getuid() + 1, 'other'),))
+    else:
+        service.policy = replace(service.policy, decisions=frozenset({'declined', 'revoked'}))
+    assert exchange(service, request)['error'] == 'unauthorized'
+    assert event_count(store) == 0
+
+
+
+def test_concurrent_socket_exact_replay(decisions):
+    from concurrent.futures import ThreadPoolExecutor
+
+    service, store, request, _, _ = decisions
+    with ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(lambda _: exchange(service, request), range(2)))
+    assert results[0] == results[1]
+    assert results[0]['ok']
+    assert event_count(store) == 1
+
+
+def test_peer_credential_failure_is_sanitized(decisions, monkeypatch):
+    import soc_automation.approval_socket as transport
+
+    service, store, request, _, _ = decisions
+
+    def fail(connection):
+        raise OSError('/secret/peer')
+
+    monkeypatch.setattr(transport, 'peer_credentials', fail)
+    # Credentials fail before request reading; only read the framed error.
+    with connect(service) as client:
+        assert receive(client) == dict(version=1, ok=False, error='authentication_failure')
+    assert event_count(store) == 0
+
+
+@pytest.mark.parametrize('confirmation', [None, 'true', 'false', 1.0, 0.5])
+def test_malformed_confirmation_no_decision(decisions, confirmation):
+    service, store, request, _, _ = decisions
+    request = dict(request, confirmed=confirmation)
+    assert exchange(service, request)['error'] == 'invalid_request'
+    assert event_count(store) == 0
+
+
+def test_duplicate_confirmation_no_decision(decisions):
+    service, store, request, _, _ = decisions
+    raw = json.dumps(request).encode()
+    raw = raw[:-1] + b', "confirmed": true}'
+    assert exchange(service, raw=struct.pack('!I', len(raw)) + raw)['error'] == 'invalid_request'
+    assert event_count(store) == 0

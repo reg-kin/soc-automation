@@ -1,6 +1,5 @@
 """Validate saved evidence and render the fixed, reviewable Cases projection."""
 
-import hashlib
 from dataclasses import asdict
 
 from soc_automation.evidence import Reference, Retrieval
@@ -31,7 +30,10 @@ def literal(value):
 
 
 def digest(value):
-    return hashlib.sha256(encode(value).encode()).hexdigest()
+    from soc_automation.deadline import check_deadline, sha256_text
+
+    check_deadline()
+    return sha256_text(encode(value))
 
 
 def render(report, alerts):
