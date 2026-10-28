@@ -191,7 +191,11 @@ class ApprovalStore:
         if expected_generation is not None and (
                 type(expected_generation) is not int or expected_generation < 1):
             raise ValueError('Explicit expected generation required')
+        from soc_automation.approval_policy import CANONICAL_POLICY_LIMIT
+
         content = _policy_content(policy)
+        if len(content.encode('utf-8')) > CANONICAL_POLICY_LIMIT:
+            raise ValueError('Canonical policy too large')
         with self._connection() as conn:
             self._validate(conn)
             active = self._active_policy_generation(conn)
