@@ -15,6 +15,7 @@ dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
 
 [project.scripts]
 soc-automation = "soc_automation.cli:main"
+soc-policy-admin = "soc_automation.policy_admin_cli:main"
 
 [tool.setuptools.package-data]
 soc_automation = ["migrations/*.sql"]

@@ -1,13 +1,14 @@
-# Trusted policy administration foundation — Phase 2A
+# Trusted policy administration foundation — Phase 2B-1
 
 ## Scope and implementation status
 
 Implemented: `inspect_policy_ledger(store, *, deadline=None)` in
 `approval_policy.py`, immutable `PolicyLedger` / `PolicyGeneration` results,
-shared runtime history validation, and raw/canonical size guards. No new CLI,
+shared runtime history validation, raw/canonical size guards, and the separate
+root-only read-only `soc-policy-admin` CLI described below. No administrative
 daemon, socket, privileged writer, manifest writer, staging, replacement, recovery,
-or deployment action is implemented. The interfaces below are a design contract
-for subsequent review and implementation, not executable commands.
+or deployment action is implemented. Mutation interfaces below remain a design
+contract for subsequent review; their CLI commands explicitly refuse execution.
 
 There is one authoritative SQLite database, one trusted soc-automation writer UID,
 and one existing policy-generation ledger. Root controls policy installation.
@@ -15,9 +16,9 @@ Human operators retain socket-only approval access; membership in the operator
 group conveys no installation authority. Approval decisions and publication
 claims retain their existing semantics.
 
-## Planned bounded offline command contract
+## Bounded offline command contract
 
-Future root-only `soc-policy-admin` accepts exactly one operation: `install`,
+Root-only `soc-policy-admin` accepts exactly one operation: `install`,
 `rotate`, `verify`, `inspect`, or `recover`. No interactive prompts, stdin policy,
 environment overrides, alternate database/live paths, inferred expectations,
 network retrieval, automatic selection, rollback, or implicit service restart.
@@ -284,3 +285,70 @@ The supported journal states and filesystem exclusions above apply to successes
 and failures alike: rollback-format main files with no journal/WAL/SHM entry only;
 hot rollback journals are rejected without recovery. Directory entries and source
 and sidecar bytes remain unchanged; atime updates remain the documented exception.
+
+## Phase 2B-1 CLI foundation
+
+The separate `soc-policy-admin` entry point now implements the strict offline
+argument contract above. `soc-automation` and the approval socket protocol are
+unchanged. All five operations require the documented explicit correlation labels
+and generation expectations. Exact long options accept separate values or `=`;
+duplicates, abbreviations, unknown options, positional extras, implicit defaults,
+and help switches are rejected with the same bounded JSON error contract. Input
+is limited to 20 tokens and 16,384 UTF-8 argument bytes; candidate paths retain
+the 4096-byte limit. Decimal generation syntax is ASCII, at most 19 digits.
+
+`inspect` requires the supplied generation to match the fully validated snapshot
+(0 matches an empty ledger). `verify` additionally requires the current digest
+and protected live policy's canonical content to match. Both use only
+`inspect_policy_ledger`, never the runtime SQLite read connection. A fixed
+five-second absolute monotonic deadline covers the complete inspect or verify
+operation, including snapshot inspection, protected live reading, generation/digest
+verification and the final success check. The same deadline is passed to ledger
+inspection and checked before and after protected reading, after comparisons, and
+after successful JSON serialization and output-size checking, immediately before
+the sole output write. Expiry discards the prepared success response entirely and
+returns sanitized `authority_unavailable` (exit 6), with all authority fields null
+and no partial successful JSON. Synchronous filesystem and output operations remain
+cooperative: blocked I/O can delay detection, and the output write may block after
+the final check. The deadline does not strictly interrupt blocking writes.
+Live reads use the
+existing bounded protected reader with production owner UID fixed to root.
+Outputs disclose authority fields only on complete success; errors retain null
+fields. No lock, evidence directory, stage, database migration, or sidecar is
+created. Filesystem atime and snapshot/concurrency limitations above still apply.
+
+Every syntactically valid command requires both real UID 0 and effective UID 0
+before accessing state. Either nonzero UID is `permission_denied`; identity
+inspection failures fail closed with sanitized errors. No privilege escalation,
+setuid behavior, or sudo invocation is implemented.
+Environment variables beginning `SOC_` and containing `PATH`, `POLICY`, `DATABASE`,
+or `ADMIN` are rejected as invalid arguments; none select administrative paths.
+The controlled Python launch/import environment remains a deployment prerequisite.
+
+`install`, `rotate`, and `recover` are explicitly unavailable: after argument,
+environment and root checks they return exit 4, `maintenance_required`, with null
+operation and operation ID and no administrative state access. Candidate syntax
+is checked, but candidates are never opened. No mutation lifecycle or maintenance
+exclusion is implemented. Read errors use sanitized `authority_unavailable` or
+`io_failure` (exit 6); protected input validation uses `unsafe_path` (exit 3).
+Generation conflicts and digest mismatches use exit 5. This foundation does not
+promise finer internal schema/history/size error distinctions from existing
+sanitized validators. stderr is empty; each invocation emits exactly the documented
+JSON object within 4096 bytes.
+
+Remaining work requires separate authorization and review: privileged maintenance
+gating, trusted service-UID database child, durable lock/evidence, staging/CAS,
+replacement and recovery. These commands provide snapshot evidence, no operator
+approval authority, service control, or permission to resume admission. Root and
+the service writer remain trusted; repository tests do not establish deployed
+ownership, filesystem crash guarantees, or quiescence.
+
+The installed-launcher regression copies the source into a disposable directory,
+installs it offline into a disposable virtual environment using locally available
+setuptools/wheel build tooling, and invokes the actual console script as a
+subprocess. CI must provision that build tooling locally; no dependencies are
+downloaded. A test-only startup guard simulates root identity, forbids state
+constructors and production-path opens, and verifies installed-package imports.
+This exercises JSON dispatch, malformed arguments, disabled installation and
+exit-code propagation without real root or persistent state. The existing project
+virtual environment and host installation are not modified.
