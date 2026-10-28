@@ -1,0 +1,23 @@
+[Unit]
+Description=Example bounded expired investigation lease recovery (disabled by default)
+
+[Service]
+Type=oneshot
+# Bound wall-clock execution as well as the number of recovered leases.
+TimeoutStartSec=2min
+User=soc-automation
+Group=soc-automation
+WorkingDirectory=/var/lib/soc-automation
+# Database settings only; no provider credentials.
+EnvironmentFile=/etc/soc-automation/recovery-environment
+ExecStart=/opt/soc-automation/.venv/bin/soc-automation recover-investigation-jobs --limit 100 --retry-seconds 60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/soc-automation
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+CapabilityBoundingSet=

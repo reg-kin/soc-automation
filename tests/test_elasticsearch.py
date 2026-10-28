@@ -351,3 +351,14 @@ runpy.run_path(sys.prefix + "/bin/soc-automation", run_name="__main__")
     )
     assert json.loads(result.stdout)["persisted"] is False
     assert not (tmp_path / "soc_automation.db").exists()
+
+
+@pytest.mark.parametrize("dotted", [False, True])
+def test_fetch_alert_numeric_user_id(settings, transport, dotted):
+    item = source("synthetic-alerts", "numeric-user")
+    item["_source"].update({"user.id": 1001} if dotted else {"user": {"id": 1001}})
+    response(transport, item)
+    fetched = ElasticsearchProvider(settings).fetch_alert(Reference(item["_index"], item["_id"]))
+    assert fetched == item
+    value = fetched["_source"]["user.id"] if dotted else fetched["_source"]["user"]["id"]
+    assert type(value) is int

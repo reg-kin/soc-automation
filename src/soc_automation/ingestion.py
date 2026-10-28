@@ -191,6 +191,8 @@ def normalize(
             if path == "process.pid":
                 if type(value) is not int or value < 0:
                     raise InputError("Invalid process identifier")
+            elif path == "user.id" and type(value) is int:
+                pass
             elif not isinstance(value, str) or not value.strip():
                 raise InputError("Invalid entity identifier")
         entities[path] = value

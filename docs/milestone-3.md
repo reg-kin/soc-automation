@@ -1,5 +1,10 @@
 # Milestone 3: offline evidence retrieval and investigation
 
+This document preserves the original milestone 3 design and validation record.
+Engine 3.0 was the original milestone version; the current implementation uses engine
+3.1. Historical test counts and offline-only scope below describe that milestone,
+not the full current implementation.
+
 ## Existing implementation review
 
 Reviewed ingestion.py, triage.py, state.py, service.py, cli.py, both existing migrations, all existing fixtures/tests and milestone-2.md. Ingestion hashes canonical [index, document ID] into the foundation source identity; the processing UUID is what --alert-id selects. Original JSON and SHA256, normalized ancestors (including type/depth), policy decisions and entity context are immutable. Ancestors are references, not sequence contents. Dotted/nested ECS access rejects conflicting representations. The existing parser supplies bounded JSON validation. Lifecycle triggers and audits remain intact; investigating is entered when a first report is saved. Partial evidence does not mark the alert completed or failed. Existing completed/failed alerts can be examined without rewriting their lifecycle.
@@ -20,7 +25,7 @@ service.investigate loads immutable ingested alerts for explicitly selected proc
 
 Observed facts contain source context and exact evidence references. Associations use exact nonempty process.entity_id, process.parent.entity_id, user.id, session.id and host.id matches, plus process entity to parent entity references. They carry association_only certainty and causation_established=false. Host names, rule identity, severity, chronology and proximity never establish an association. Shared host/user/parent identifiers can be weak associations; the report exposes supporting fields rather than asserting a causal chain, successful escalation or compromise. Event actions are preserved descriptions, not interpreted detection rules. Unknown compromise and causal relationships remain explicit questions.
 
-Report schema_version=1 includes deterministic investigation ID, request fingerprint, selected alert IDs, full references, retrieval statuses and original hits/hashes, timeline, observed facts, supported inferences, gaps, status, generation time, engine_version=3.0 and audit correlation UUID. completed means evidence processing completed, not confirmed compromise; partial means evidence is unavailable or unusable. Reports and source hits may contain sensitive evidence: protect the database and CLI JSON outputs with existing deployment permissions and umask guidance. Logging never includes evidence.
+Report schema_version=1 includes deterministic investigation ID, request fingerprint, selected alert IDs, full references, retrieval statuses and original hits/hashes, timeline, observed facts, supported inferences, gaps, status, generation time, engine_version=3.0 in the original milestone (3.1 in the current implementation) and audit correlation UUID. completed means evidence processing completed, not confirmed compromise; partial means evidence is unavailable or unusable. Reports and source hits may contain sensitive evidence: protect the database and CLI JSON outputs with existing deployment permissions and umask guidance. Logging never includes evidence.
 
 ## Persistence and repeat execution
 
@@ -28,7 +33,13 @@ Run init-db to migrate. Additive migration 003 retains migrations 001/002 and ad
 
 Investigation ID is inv- plus SHA256(canonical [engine version, sorted unique processing alert UUIDs]). The same request re-retrieves evidence and compares a fingerprint of the entire canonical retrieval snapshot, including missing/failed statuses. Equivalent selection and evidence return the exact original report and append a duplicate audit with the new attempt correlation UUID. Changed evidence/status under that request is rejected; found evidence conflicting with any previously saved source identity is also rejected across requests. Prior results are never replaced. Failed attempts create no success report and can be retried safely. Failure audit is deliberately separate from report status.
 
-Future explicit re-investigation needs a revision/request-generation key and links to prior reports; evidence revisions need versioned snapshots rather than overwriting pinned source identities. Neither workflow is implicitly enabled by changing fixtures. Engine upgrades create different request identities but still respect pinned evidence.
+Future explicit re-investigation needs a revision/request-generation key and links to prior reports; evidence revisions need versioned snapshots rather than overwriting pinned source identities. Neither workflow is implicitly enabled by changing fixtures. Engine version changes (including 3.0 to 3.1) create distinct investigation IDs and
+request fingerprints for the same selected alerts, but still respect pinned evidence.
+Same-version evidence revisions do not automatically create new investigation
+identities: the existing identity is reused and a changed retrieval snapshot is
+rejected rather than replacing the report. See milestone-5c-operations.md for queue
+drain requirements, terminal legacy-job mismatch and the existing explicit manual
+investigation procedure; a new manual report does not repair or replace a failed job.
 
 ## Offline usage
 

@@ -28,23 +28,32 @@ def ingest(
         raise
 
 
+def construct_investigation(store, alert_ids, provider, *, correlation_id=None):
+    """Shared report construction; performs no report persistence or publication."""
+    from uuid import uuid4
+
+    from soc_automation.investigation import build, request_identity
+
+    ids, fingerprint = request_identity(alert_ids)
+    alerts = [store.show_alert(identifier, evidence=True) for identifier in ids]
+    report = build(alerts, provider)
+    report.update(
+        investigation_id="inv-" + fingerprint,
+        request_fingerprint=fingerprint,
+        audit_correlation_id=correlation_id or str(uuid4()),
+    )
+    return report
+
+
 def investigate(store: Store, alert_ids: list[str], provider) -> dict:
     """Changed evidence never replaces prior results."""
     import sqlite3
     from uuid import uuid4
 
-    from soc_automation.investigation import build, request_identity
-
     correlation_id = str(uuid4())
     try:
-        ids, fingerprint = request_identity(alert_ids)
-        alerts = [store.show_alert(identifier, evidence=True) for identifier in ids]
-        report = build(alerts, provider)
-        report.update(
-            investigation_id="inv-" + fingerprint,
-            request_fingerprint=fingerprint,
-            audit_correlation_id=correlation_id,
-        )
+        report = construct_investigation(store, alert_ids, provider, correlation_id=correlation_id)
+        fingerprint = report["request_fingerprint"]
         return store.save_investigation(report, fingerprint)
     except (ValueError, StateError, OSError, sqlite3.Error):
         store.investigation_failure(correlation_id)
