@@ -3,7 +3,8 @@
 The Linux AF_UNIX service supports health, approve, decline and revoke through
 schema 10's existing decision engine. Approval records authorization; it does not
 publish a case. There is no publication, reconciliation, remediation, policy
-administration, operator CLI or production service installation in this milestone.
+administration or production service installation in this transport milestone.
+The subsequent [operator CLI](operator-cli.md) uses this exact protocol.
 See [internal approval persistence](internal-approval.md).
 
 ## Trust boundary and accounts

@@ -153,7 +153,9 @@ covers the full new gate and manual publication with valid preparation and polic
 Milestones 6.3B-2A/2B add protected policy loading and kernel-authenticated Unix
 socket health and decision operations; see [the protocol](approval-socket.md).
 Approval records authorization; it does not publish a case. Policy deployment
-integration, operator CLI, automatic publication and remediation remain absent.
+integration, automatic publication and remediation remain absent. The subsequent
+[operator CLI](operator-cli.md) provides authenticated socket decisions without
+changing this engine or granting database review access.
 The example UID 10001 grant is effective and must be replaced before deployment. There
 is no new runtime dependency or production infrastructure change. Deployment
 ownership and permissions remain administrative responsibilities. Checksums detect stored

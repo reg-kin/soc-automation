@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from soc_automation import preparation_coordinator
+from soc_automation import operator_cli, preparation_coordinator
 from soc_automation.config import (
     ConfigurationError,
     ElasticsearchSettings,
@@ -48,12 +48,16 @@ def _safe_decision(decision: dict) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    supplied = list(argv) if argv is not None else sys.argv[1:]
+    if supplied and supplied[0] in operator_cli.COMMANDS:
+        return operator_cli.main(supplied)
     parser = argparse.ArgumentParser(
         description="SOC automation administration and alert ingestion", allow_abbrev=False
     )
     parser.add_argument(
         "command",
         choices=(
+            *operator_cli.COMMANDS,
             "list-case-publications",
             "review-case-publication",
             "run-case-preparation",
@@ -122,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-alert-bytes", type=int, default=262_144)
     parser.add_argument("--max-batch-size", type=int, default=100)
     args = parser.parse_args(argv)
+    if args.command in operator_cli.COMMANDS:
+        parser.error("operator command must precede its options")
     supplied = argv if argv is not None else sys.argv[1:]
     option_commands = {
         "--review-status": {"list-case-publications"},
