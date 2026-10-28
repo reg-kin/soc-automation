@@ -931,3 +931,202 @@ def test_duplicate_confirmation_no_decision(decisions):
     raw = raw[:-1] + b', "confirmed": true}'
     assert exchange(service, raw=struct.pack('!I', len(raw)) + raw)['error'] == 'invalid_request'
     assert event_count(store) == 0
+
+
+@pytest.mark.parametrize('outcome', ['release', 'timeout', 'corrupt', 'rotate', 'evidence'])
+def test_policy_sql_contention_after_connection_setup(decisions, monkeypatch, outcome):
+    """Acquire a real exclusive lock only after admission's BEGIN has completed."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from soc_automation.deadline import current_deadline
+
+    service, store, request, _, _ = decisions
+    if outcome != 'timeout':
+        service.settings = replace(service.settings, connection_seconds=5)
+    entered, proceed, busy = threading.Event(), threading.Event(), threading.Event()
+    rotated = threading.Event()
+    original = service.store._validate
+    attempts, deadlines = [], []
+
+    def validate(conn):
+        attempts.append(conn)
+        deadlines.append(current_deadline.get())
+        if len(attempts) == 2:
+            with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+                attempts[0].execute('SELECT 1')
+        if len(attempts) == 1:
+            assert conn.in_transaction
+            entered.set()
+            assert proceed.wait(2)
+        if outcome == 'rotate' and len(attempts) > 1:
+            assert rotated.wait(2)
+        try:
+            return original(conn)
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode == sqlite3.SQLITE_BUSY:
+                busy.set()
+            raise
+
+    monkeypatch.setattr(service.store, '_validate', validate)
+    blocker = sqlite3.connect(store.path, isolation_level=None, timeout=0)
+    started = time.monotonic()
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(exchange, service, request)
+        try:
+            assert entered.wait(2)
+            blocker.execute('BEGIN EXCLUSIVE')
+            assert exchange(service, dict(request, target='https://other.test/default/x'))[
+                'error'] == 'unauthorized'
+            if outcome == 'corrupt':
+                blocker.execute('DROP TRIGGER policy_generation_no_update')
+                blocker.execute("UPDATE review_policy_generations SET content_sha256=?",
+                                ('0' * 64,))
+            elif outcome == 'evidence':
+                triggers = blocker.execute("SELECT name,sql FROM sqlite_master WHERE "
+                                           "type='trigger' AND "
+                                           "tbl_name='investigation_evidence'").fetchall()
+                for name, _ in triggers:
+                    blocker.execute('DROP TRIGGER "' + name + '"')
+                blocker.execute("UPDATE investigation_evidence SET original_json='{}'")
+                for _, sql in triggers:
+                    blocker.execute(sql)
+            proceed.set()
+            assert busy.wait(2)
+            if outcome == 'timeout':
+                result = future.result(timeout=2)
+                assert result == dict(version=1, ok=False, error='timeout')
+                assert time.monotonic() >= deadlines[0]
+                assert time.monotonic() - started < 2
+            else:
+                blocker.commit()
+                if outcome == 'rotate':
+                    store.install_review_policy(replace(service.policy, version='review/2'),
+                                                expected_generation=1)
+                    rotated.set()
+                result = future.result(timeout=2)
+        finally:
+            proceed.set()
+            rotated.set()
+            blocker.rollback()
+            blocker.close()
+    if outcome == 'rotate':
+        assert result['error'] == 'policy_unavailable'
+    elif outcome in {'corrupt', 'evidence'}:
+        assert result['error'] == ('policy_unavailable' if outcome == 'corrupt'
+                                   else 'evidence_verification_failure')
+    elif outcome == 'release':
+        assert result['ok']
+        assert exchange(service, request) == result
+    if outcome != 'timeout':
+        assert len(attempts) >= 2
+        assert len({id(conn) for conn in attempts[:2]}) == 2
+        assert len(set(deadlines[:2])) == 1
+    # With the lock held, the fresh connection can exhaust the deadline during setup.
+    assert event_count(store) == (1 if outcome == 'release' else 0)
+
+
+def test_populated_read_methods_and_evidence_under_writer_lock(decisions):
+    _, store, request, report, _ = decisions
+    alert_id = report['source_alert_ids'][0]
+    expected = (store.audit_records(alert_id), store.show_alert(alert_id, evidence=True),
+                store.show_investigation(report['investigation_id']),
+                store.show_case_publication(request['publication_id']))
+    assert all(expected)
+    with sqlite3.connect(store.path) as writer:
+        writer.execute('BEGIN IMMEDIATE')
+        store.healthcheck()
+        assert (store.audit_records(alert_id), store.show_alert(alert_id, evidence=True),
+                store.show_investigation(report['investigation_id']),
+                store.show_case_publication(request['publication_id'])) == expected
+        store.validate_case_evidence(report)
+
+
+@pytest.mark.parametrize('code', [sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_SNAPSHOT,
+                                  sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CORRUPT])
+@pytest.mark.parametrize('outcome', ['release', 'timeout', 'rotate'])
+def test_wrapped_ledger_sql_error(decisions, monkeypatch, code, outcome):
+    """Inject execute inside the real helper and observe its StateError wrapper."""
+    import time
+
+    from soc_automation.deadline import current_deadline
+
+    service, store, request, _, _ = decisions
+    original_active = service.store._active_policy_generation
+    original_validate = service.store._validate
+    snapshots, deadlines, wrapped, generations = [], [], [], []
+    busy = (code & 0xff) == sqlite3.SQLITE_BUSY
+
+    def validate(conn):
+        if snapshots:
+            with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+                snapshots[-1].execute('SELECT 1')
+            if outcome == 'rotate' and len(snapshots) == 1:
+                store.install_review_policy(replace(service.policy, version='review/2'),
+                                            expected_generation=1)
+        return original_validate(conn)
+
+    class LedgerConnection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def execute(self, sql):
+            assert sql == 'SELECT * FROM review_policy_generations ORDER BY generation'
+            if len(snapshots) == 1 or outcome == 'timeout':
+                exc = sqlite3.OperationalError('injected ledger SQL error')
+                exc.sqlite_errorcode = code
+                raise exc
+            return self.conn.execute(sql)
+
+    def active(conn):
+        snapshots.append(conn)
+        deadlines.append(current_deadline.get())
+        try:
+            row = original_active(LedgerConnection(conn))
+            generations.append(row['generation'])
+            return row
+        except StateError as exc:
+            assert isinstance(exc.__cause__, sqlite3.OperationalError)
+            assert exc.__cause__.sqlite_errorcode == code
+            assert str(exc) == 'Authoritative active policy state corrupt or unavailable'
+            wrapped.append(exc)
+            raise
+
+    monkeypatch.setattr(service.store, '_validate', validate)
+    monkeypatch.setattr(service.store, '_active_policy_generation', active)
+    result = exchange(service, request)
+    assert wrapped
+    if busy and outcome == 'timeout':
+        assert time.monotonic() >= deadlines[0]
+    if busy and outcome == 'rotate':
+        assert generations == [2]
+    monkeypatch.setattr(service.store, '_validate', original_validate)
+    monkeypatch.setattr(service.store, '_active_policy_generation', original_active)
+    success = busy and outcome == 'release'
+    if success:
+        assert result['ok']
+        assert exchange(service, request) == result
+    else:
+        assert result['error'] == ('timeout' if busy and outcome == 'timeout'
+                                   else 'policy_unavailable')
+    if busy:
+        assert len(snapshots) >= 2
+        assert snapshots[0] is not snapshots[1]
+        assert len(set(deadlines)) == 1
+    else:
+        assert len(snapshots) == 1
+    assert event_count(store) == int(success)
+
+
+def test_arbitrary_ledger_state_error_is_not_retried(decisions, monkeypatch):
+    service, store, request, _, _ = decisions
+    attempts = []
+
+    def active(conn):
+        attempts.append(conn)
+        raise StateError('unavailable without SQLite cause')
+
+    monkeypatch.setattr(service.store, '_active_policy_generation', active)
+    assert exchange(service, request)['error'] == 'policy_unavailable'
+    assert len(attempts) == 1
+    assert event_count(store) == 0

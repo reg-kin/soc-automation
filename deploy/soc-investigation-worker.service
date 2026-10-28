@@ -12,6 +12,8 @@ WorkingDirectory=/var/lib/soc-automation
 # Separate file: SQLite and read-only Elasticsearch only; no Kibana credentials.
 EnvironmentFile=/etc/soc-automation/worker-environment
 ExecStart=/opt/soc-automation/.venv/bin/soc-automation run-investigation-worker --max-jobs 10 --provider elasticsearch
+StateDirectory=soc-automation
+StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

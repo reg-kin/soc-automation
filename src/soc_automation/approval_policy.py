@@ -3,12 +3,14 @@
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from soc_automation.approval import ReviewPolicy, _policy_content, _uid
+from soc_automation.deadline import check_deadline
 from soc_automation.publication_review import _object
 from soc_automation.state import StateError
 
@@ -137,34 +139,51 @@ class PolicySource:
 
 def verify_authority(store, policy, *, deadline=None):
     """Read-only snapshot; validate *all* ledger semantics, then exact active content."""
-    try:
-        with store._connection(readonly=True, deadline=deadline) as conn:
-            if deadline is not None:
-                conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
-            store._validate(conn)
-            oversized = conn.execute(
-                'SELECT 1 FROM review_policy_generations '
-                'WHERE length(CAST(content AS BLOB))>? LIMIT 1', (POLICY_LIMIT,)
-            ).fetchone()
-            if oversized:
+    while True:
+        check_deadline(deadline)
+        try:
+            return _verify_authority_snapshot(store, policy, deadline=deadline)
+        except TimeoutError:
+            raise
+        except (sqlite3.OperationalError, StateError) as exc:
+            # The ledger helper preserves the originating SQLite error.
+            cause = exc.__cause__ if isinstance(exc, StateError) else exc
+            # Extended BUSY codes (including BUSY_SNAPSHOT) are contention too.
+            # The context manager has rolled back and closed the old connection.
+            # Never retry statements within its potentially stale read snapshot.
+            if (deadline is None or not isinstance(cause, sqlite3.Error)
+                    or (getattr(cause, 'sqlite_errorcode', 0) & 0xff) != sqlite3.SQLITE_BUSY):
+                raise StateError('Policy authority unavailable') from exc
+            check_deadline(deadline)
+            time.sleep(min(0.005, max(0, deadline - time.monotonic())))
+        except Exception as exc:
+            raise StateError('Policy authority unavailable') from exc
+
+
+def _verify_authority_snapshot(store, policy, *, deadline):
+    with store._connection(readonly=True, deadline=deadline) as conn:
+        if deadline is not None:
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        store._validate(conn)
+        oversized = conn.execute(
+            'SELECT 1 FROM review_policy_generations '
+            'WHERE length(CAST(content AS BLOB))>? LIMIT 1', (POLICY_LIMIT,)
+        ).fetchone()
+        if oversized:
+            raise ValueError('Oversized authority')
+        active = store._active_policy_generation(conn)
+        versions = set()
+        for row in conn.execute('SELECT * FROM review_policy_generations ORDER BY generation'):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError
+            content = row['content']
+            if len(content.encode()) > POLICY_LIMIT:
                 raise ValueError('Oversized authority')
-            active = store._active_policy_generation(conn)
-            versions = set()
-            for row in conn.execute('SELECT * FROM review_policy_generations ORDER BY generation'):
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError
-                content = row['content']
-                if len(content.encode()) > POLICY_LIMIT:
-                    raise ValueError('Oversized authority')
-                candidate = policy_from_content(content)
-                if (content != _policy_content(candidate) or candidate.version in versions
-                        or candidate.version != row['version']
-                        or hashlib.sha256(content.encode()).hexdigest() != row['content_sha256']):
-                    raise ValueError('Inconsistent authority')
-                versions.add(candidate.version)
-            if active is None or active['content'] != _policy_content(policy):
-                raise ValueError('Missing or superseded authority')
-    except TimeoutError:
-        raise
-    except Exception as exc:
-        raise StateError('Policy authority unavailable') from exc
+            candidate = policy_from_content(content)
+            if (content != _policy_content(candidate) or candidate.version in versions
+                    or candidate.version != row['version']
+                    or hashlib.sha256(content.encode()).hexdigest() != row['content_sha256']):
+                raise ValueError('Inconsistent authority')
+            versions.add(candidate.version)
+        if active is None or active['content'] != _policy_content(policy):
+            raise ValueError('Missing or superseded authority')

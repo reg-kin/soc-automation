@@ -20,14 +20,14 @@ from soc_automation.preflight import (
 )
 from soc_automation.state import StateError, Store
 
-DATABASE = Path('/var/lib/soc-approval/soc_automation.db')
+DATABASE = Path('/var/lib/soc-automation/soc_automation.db')
 POLICY = Path('/etc/soc-approval/review-policy.json')
 SOCKET = Path('/run/soc-approval/operator.sock')
 
 
 def composition():
     """Validate provisioned identity and state without creating or migrating anything."""
-    uid = pwd.getpwnam('soc-approval').pw_uid
+    uid = pwd.getpwnam('soc-automation').pw_uid
     gid = grp.getgrnam('soc-approval-operators').gr_gid
     if uid == 0 or os.getuid() != uid or os.geteuid() != uid:
         raise ValueError('Dedicated unprivileged account required')
@@ -63,6 +63,9 @@ def composition():
         os.close(runtime)
     settings = SocketSettings(SOCKET, uid, gid)
     source, store = PolicySource(POLICY), Store(DATABASE, timeout=0.1)
+    with store._connection(readonly=True) as connection:
+        if connection.execute("PRAGMA journal_mode").fetchone()[0] not in {"delete", "wal"}:
+            raise ValueError("Unsupported deployment journal mode")
     source.load(store)
     if POLICY.lstat().st_mode & 0o007:
         raise ValueError('Policy must not be accessible to other accounts')

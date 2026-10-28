@@ -273,7 +273,7 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
             raise StateError("Database schema objects are missing")
 
     def healthcheck(self) -> None:
-        with self._connection() as connection:
+        with self._connection(readonly=True) as connection:
             self._validate(connection)
             if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise StateError("Database integrity check failed")
@@ -320,7 +320,7 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
             )
 
     def audit_records(self, alert_id: str) -> list[dict]:
-        with self._connection() as connection:
+        with self._connection(readonly=True) as connection:
             self._validate(connection)
             return [
                 dict(row)
@@ -413,7 +413,7 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
         """Allowlisted summary by default; evidence retrieval is an explicit Python API."""
         import json
 
-        with self._connection() as connection:
+        with self._connection(readonly=True) as connection:
             self._validate(connection)
             row = connection.execute(
                 "SELECT a.state, i.* FROM alerts a JOIN ingested_alerts i ON i.alert_id=a.id "
@@ -436,7 +436,7 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
     def show_investigation(self, investigation_id: str) -> dict:
         import json
 
-        with self._connection() as connection:
+        with self._connection(readonly=True) as connection:
             self._validate(connection)
             row = connection.execute(
                 "SELECT report_json FROM investigations WHERE id=?", (investigation_id,)
@@ -578,7 +578,7 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
         )
 
     def show_case_publication(self, publication_id):
-        with self._connection() as connection:
+        with self._connection(readonly=True) as connection:
             self._validate(connection)
             row = connection.execute(
                 "SELECT * FROM case_publications WHERE id=?", (publication_id,)
@@ -632,7 +632,7 @@ class Store(DiscoveryStore, PreparationStore, PublicationReviewStore, ApprovalSt
 
     def validate_case_evidence(self, report):
         """Cross-check the immutable report against the separately stored evidence ledger."""
-        with self._connection() as connection:
+        with self._connection(readonly=True) as connection:
             self._validate(connection)
             self._validate_report_evidence(connection, report)
 

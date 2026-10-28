@@ -11,6 +11,8 @@ WorkingDirectory=/var/lib/soc-automation
 # Database settings only; no provider credentials.
 EnvironmentFile=/etc/soc-automation/recovery-environment
 ExecStart=/opt/soc-automation/.venv/bin/soc-automation recover-investigation-jobs --limit 100 --retry-seconds 60
+StateDirectory=soc-automation
+StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

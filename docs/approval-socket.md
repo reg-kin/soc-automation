@@ -55,8 +55,8 @@ An example layout, to be provisioned by administrators rather than the service:
 | `/etc/soc-approval/review-policy.json` | root / service group | 0640 | Administrator policy |
 | `/run/soc-approval` | service / operators | 0750 | Socket directory |
 | `/run/soc-approval/operator.sock` | service / operators | 0660 | Created by service |
-| `/var/lib/soc-approval` | service / service | 0700 | Existing initialized database |
-| `/var/lib/soc-approval/soc_automation.db` | service / service | 0600 | Schema 10 authority |
+| `/var/lib/soc-automation` | service / service | 0700 | Existing initialized database |
+| `/var/lib/soc-automation/soc_automation.db` | service / service | 0600 | Schema 10 authority |
 
 All ancestors, including `/`, are checked. Policy ancestors must be owned by root
 or `PolicySource.owner_uid`, with no group/other write bits. The policy itself
@@ -117,7 +117,7 @@ from soc_automation.approval_policy import PolicySource
 from soc_automation.state import Store
 
 source = PolicySource(Path('/etc/soc-approval/review-policy.json'), owner_uid=0)
-store = Store(Path('/var/lib/soc-approval/soc_automation.db'))
+store = Store(Path('/var/lib/soc-automation/soc_automation.db'))
 candidate = source.read_candidate()
 # Only after separate administrative authentication/authorization:
 store.install_review_policy(candidate, expected_generation=None)
@@ -321,6 +321,17 @@ busy wait, checking the remaining budget. Expiry before commit rolls back the wh
 transaction, including any inserted review event, and returns the sanitized `timeout`
 error when the response can still be delivered. Connection handlers are removed
 and transaction context is reset on every exit.
+
+Transient `SQLITE_BUSY` (including `SQLITE_BUSY_SNAPSHOT` and SQLite errors
+directly chained by the ledger helper into `StateError`) inside policy admission
+restarts the complete read-only authority transaction after rollback and connection
+closure. Every attempt revalidates the schema, ledger and exact active policy in a
+fresh snapshot, using the original request deadline. Retry pauses are at most 5 ms
+and capped by the remaining budget. Held contention expires as `timeout`; genuine
+policy corruption or supersession remains `policy_unavailable`. This retry does
+not replay approval mutations or an uncertain commit and does not change the
+request-ID replay contract. Administrative loading without a request deadline
+retains its existing SQLite timeout and does not restart authority transactions.
 
 This is a cooperative execution deadline, not a hard real-time completion bound.
 Filesystem/kernel calls, JSON parsing/serialization, individual native operations,

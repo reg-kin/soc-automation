@@ -23,9 +23,9 @@ def test_unit_and_actual_launcher_arguments(monkeypatch):
     service = unit['Service']
     assert service['Type'] == 'notify'
     assert service['NotifyAccess'] == 'main'
-    assert service['User'] == 'soc-approval'
+    assert service['User'] == 'soc-automation'
     assert service['Group'] == 'soc-approval-operators'
-    assert service['SupplementaryGroups'] == 'soc-approval'
+    assert service['SupplementaryGroups'] == 'soc-automation'
     assert service['RuntimeDirectoryMode'] == '0750'
     assert service['RuntimeDirectoryPreserve'] == 'yes'
     assert service['StateDirectoryMode'] == '0700'
@@ -34,7 +34,7 @@ def test_unit_and_actual_launcher_arguments(monkeypatch):
     assert service['RestrictAddressFamilies'] == 'AF_UNIX'
     assert service['IPAddressDeny'] == 'any'
     assert service['ProtectSystem'] == 'strict'
-    assert service['ReadWritePaths'] == '/var/lib/soc-approval /run/soc-approval'
+    assert service['ReadWritePaths'] == '/var/lib/soc-automation /run/soc-approval'
     assert service['Restart'] == 'on-failure'
     assert service['TimeoutStartSec'] == '30'
     assert service['TimeoutStopSec'] == '10'
@@ -571,3 +571,140 @@ def test_preflight_diagnostics_cannot_write_inherited_policy(tmp_path, monkeypat
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
     assert path.read_bytes() == b'protected policy'
+
+
+def test_fixed_shared_database_and_account(monkeypatch):
+    assert daemon.DATABASE == Path('/var/lib/soc-automation/soc_automation.db')
+    names = []
+
+    def account(name):
+        names.append(name)
+        raise KeyError(name)
+
+    monkeypatch.setattr(daemon.pwd, 'getpwnam', account)
+    with pytest.raises(KeyError):
+        daemon.composition()
+    assert names == ['soc-automation']
+    for name in ('soc-approval', 'soc-investigation-worker', 'soc-investigation-recovery'):
+        unit = ConfigParser(interpolation=None)
+        unit.read(Path(__file__).parents[1] / f'deploy/{name}.service')
+        assert unit['Service']['User'] == 'soc-automation'
+        assert unit['Service']['StateDirectory'] == 'soc-automation'
+        assert unit['Service']['StateDirectoryMode'] == '0700'
+
+
+@pytest.mark.parametrize('mode', ['delete', 'wal'])
+def test_explicit_journal_verification_no_switch(deployment, mode):
+    root, _, _, store, _ = deployment
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(f'PRAGMA journal_mode={mode}').fetchone()[0] == mode
+        conn.execute('SELECT count(*) FROM sqlite_master').fetchone()
+        if mode == 'wal':
+            for suffix in ('-wal', '-shm'):
+                Path(str(store.path) + suffix).chmod(0o600)
+        before = filesystem_snapshot(root)
+        # This process holds SQLite WAL mappings; confined-launcher coverage uses
+        # the separate writer process in test_confined_preflight_filesystem_and_wal.
+        assert daemon.composition()
+        assert filesystem_snapshot(root) == before
+        assert conn.execute('PRAGMA journal_mode').fetchone()[0] == mode
+
+
+def test_policy_group_read_without_group_write(deployment):
+    _, _, source, store, _ = deployment
+    source.path.chmod(0o640)
+    assert source.load(store)
+    assert daemon.composition()
+    source.path.chmod(0o660)
+    with pytest.raises(ValueError, match='Unsafe protected path'):
+        source.load(store)
+
+
+@pytest.mark.parametrize('suffix', ['', '-wal', '-shm', '-journal'])
+def test_foreign_database_ownership_rejected(deployment, monkeypatch, suffix):
+    _, _, _, store, _ = deployment
+    target = Path(str(store.path) + suffix)
+    if suffix:
+        target.write_bytes(b'')
+        target.chmod(0o600)
+    original = daemon.os.stat
+
+    def foreign(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if path == target.name:
+            fields = {key: getattr(info, key) for key in dir(info) if key.startswith('st_')}
+            fields['st_uid'] = os.getuid() + 1
+            return SimpleNamespace(**fields)
+        return info
+
+    monkeypatch.setattr(daemon.os, 'stat', foreign)
+    with pytest.raises(ValueError, match='database|sidecar'):
+        daemon.composition()
+
+
+def test_read_methods_do_not_reserve_writer_lock(tmp_path):
+    store = Store(tmp_path / 'readonly.db', timeout=0)
+    store.initialize()
+    with sqlite3.connect(store.path) as writer:
+        writer.execute('BEGIN IMMEDIATE')
+        store.healthcheck()
+        assert store.audit_records('missing') == []
+        for method in (store.show_alert, store.show_investigation, store.show_case_publication):
+            with pytest.raises(StateError, match='Unknown'):
+                method('missing')
+        with pytest.raises(StateError, match='snapshot mismatch'):
+            store.validate_case_evidence({'investigation_id': 'missing', 'retrieved_evidence': []})
+
+
+def test_foreign_state_directory_owner_rejected(deployment, monkeypatch):
+    _, _, _, store, _ = deployment
+    original = daemon.os.fstat
+    inode = store.path.parent.stat().st_ino
+
+    def foreign(fd):
+        info = original(fd)
+        if info.st_ino == inode:
+            fields = {key: getattr(info, key) for key in dir(info) if key.startswith('st_')}
+            fields['st_uid'] = os.getuid() + 1
+            return SimpleNamespace(**fields)
+        return info
+
+    monkeypatch.setattr(daemon.os, 'fstat', foreign)
+    with pytest.raises(ValueError):
+        daemon.composition()
+
+
+def test_missing_database_not_initialized(deployment):
+    root, _, _, store, _ = deployment
+    store.path.unlink()
+    before = filesystem_snapshot(root)
+    assert daemon.main(['--check']) == 1
+    assert filesystem_snapshot(root) == before
+
+
+def test_fresh_database_default_journal_mode(tmp_path):
+    store = Store(tmp_path / 'fresh.db')
+    store.initialize()
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute('PRAGMA journal_mode').fetchone()[0] == 'delete'
+
+
+@pytest.mark.parametrize('mode', ['truncate', 'persist', 'memory', 'off'])
+def test_unsupported_journal_modes_rejected(deployment, monkeypatch, mode):
+    from contextlib import contextmanager
+
+    _, _, _, store, _ = deployment
+    # These modes are connection-local: keep the actual SQLite connection pinned
+    # so composition observes the selected mode rather than a new DELETE default.
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute(f'PRAGMA journal_mode={mode}').fetchone()[0] == mode
+
+        @contextmanager
+        def pinned(self, **kwargs):
+            assert kwargs == {'readonly': True}
+            yield conn
+
+        monkeypatch.setattr(Store, '_connection', pinned)
+        with pytest.raises(ValueError, match='Unsupported deployment journal mode'):
+            daemon.composition()
+        assert conn.execute('PRAGMA journal_mode').fetchone()[0] == mode

@@ -1,7 +1,7 @@
-# Secure approval deployment — Milestone 6.3B-3B
+# Secure approval deployment — Milestone 6.3B-3C Phase 2
 
 These are offline assets, not an installation or a production certification.
-Baseline: `e1d3290d34762c60daa970ff15326e5ddd68012c`.
+Baseline: `05339f076a8885d6a7c1412f51daef3f7c045960`.
 No accounts, permissions, policies, services or persistent databases are changed
 by this milestone. Do not enable the unit until the prerequisites below have
 been independently provisioned and reviewed.
@@ -17,7 +17,7 @@ pointing into a user-writable checkout are unsuitable for production. Code, the
 interpreter, unit and every ancestor must be administrator-controlled. No SOC
 environment file, provider credential or publication credential is loaded.
 
-Provision a dedicated non-login `soc-approval` user and private `soc-approval`
+Use the single trusted non-login `soc-automation` user and private `soc-automation`
 group, and an explicit `soc-approval-operators` group. The unit's primary group is
 operators so systemd creates the runtime directory with the required GID. The
 private supplementary group permits policy reads. The launcher verifies that
@@ -27,13 +27,13 @@ Only the service should have the private group. Operators must not share its UID
 
 | Path | Owner / group | Mode |
 | --- | --- | --- |
-| `/etc/soc-approval` | root / soc-approval | 0750 |
-| `/etc/soc-approval/review-policy.json` | root / soc-approval | 0640 |
-| `/var/lib/soc-approval` | soc-approval / soc-approval-operators | 0700 |
-| `/var/lib/soc-approval/soc_automation.db` | soc-approval / soc-approval-operators | 0600 |
+| `/etc/soc-approval` | root / soc-automation | 0750 |
+| `/etc/soc-approval/review-policy.json` | root / soc-automation | 0640 |
+| `/var/lib/soc-automation` | soc-automation / soc-approval-operators | 0700 |
+| `/var/lib/soc-automation/soc_automation.db` | soc-automation / soc-approval-operators | 0600 |
 | SQLite `-journal`, `-wal`, `-shm` when present | service UID | 0600 |
-| `/run/soc-approval` | soc-approval / soc-approval-operators | 0750 |
-| `operator.sock` | soc-approval / soc-approval-operators | 0660 |
+| `/run/soc-approval` | soc-automation / soc-approval-operators | 0750 |
+| `operator.sock` | soc-automation / soc-approval-operators | 0660 |
 | `operator.sock.lock` | service UID | 0600 |
 
 The operator GID on state files grants no access with these modes. Never add
@@ -207,16 +207,67 @@ Publication stays disabled by the existing CLI's missing trusted publication
 policy composition; this unit intentionally does not resolve that independent
 dependency. It neither publishes real cases nor executes remediation.
 
-The approval database must be the **same authoritative database** used to prepare
-and track these publications, not a periodically copied approval-only fork.
-The existing worker units run as `soc-automation`; they cannot access the private
-`soc-approval` state directory as supplied. Integrating those trusted database
-writers requires a separate, explicit account/path and credential review; do not
-solve it by granting the operator group database access or weakening 0700/0600.
-All database writers can affect the approval trust boundary. Provisioning that
-shared authoritative workflow is a deployment gate, not an implicit permission
-change made by this unit. Read-only reviewer backup copies are for inspection
-only and must never become an alternative decision authority.
+The approval database is `/var/lib/soc-automation/soc_automation.db`, the same
+live authority used by investigation, preparation, recovery and future trusted
+publication composition. Configure all worker/recovery environment files and other
+trusted CLI compositions to this exact absolute path; the approval daemon ignores
+environment configuration. Never use a copied approval-only fork. All direct
+writers run as `soc-automation` and belong to the approval-integrity trust boundary:
+a compromised worker can affect approval authority. This architecture deliberately
+does not isolate trusted writers from each other. Operators receive socket access
+only and must never join the private service group. Read-only review backups must
+never become an alternative decision authority.
+
+## Journal policy and startup ordering
+
+The default deployment policy is SQLite DELETE rollback journaling. Fresh explicit
+`Store.initialize()` uses SQLite's default DELETE mode; initialization is an
+administrator action, never a service startup action. Do not assume initialization
+changes an existing database's journal mode. Under quiescence, an administrator
+must inspect `PRAGMA journal_mode` and require `delete` for this default profile.
+Approval startup checks that the existing mode is `delete` or `wal`, rejecting
+other observed modes without changing them. Non-WAL modes such as PERSIST and
+TRUNCATE are connection-local and are not a durable deployment selection; new
+connections normally observe DELETE. This check is not an initialization
+or migration command. Ordinary Store connections retain FULL synchronous mode,
+foreign keys, and existing transaction/locking semantics.
+
+WAL is a supported explicit administrative alternative, not enabled by these
+assets. Before selecting it, stop all readers/writers and admission, take and test
+a consistent backup, assess schema and policy, and obtain deployment review.
+Only that controlled administrative connection may execute
+`PRAGMA journal_mode=WAL` outside a transaction; require the returned value `wal`
+and verify it again from a new connection. Record the selected profile in the host
+runbook. Changing an existing database's mode requires this separate procedure;
+no service performs it. Do not issue mode-setting PRAGMAs as health probes.
+
+Provision code, accounts, protected policy, shared state and runtime directories
+first; initialize/migrate schema and install matching policy authority only through
+separate reviewed administration. Validate worker and recovery configuration before
+starting any writer. Neither example unit initializes schema. Stop competing writers
+during administration, run the exact isolated approval preflight as the service
+identity, and start approval only after it succeeds. No extra systemd unit is needed.
+
+WAL and SHM must be service-owned, single-link regular files, mode 0600, within the
+0700 state directory; rollback journals have the same requirements. With WAL,
+normal last-connection close may remove sidecars. Before confined preflight, trusted
+administration must establish usable sidecars through SQLite with a controlled
+connection retained as needed; never fabricate empty sidecars. Missing or unusable
+sidecars, pending recovery or unsupported schema cause preflight failure. Diagnose
+and recover under stopped admission; never bypass Landlock or use immutable reads.
+A cleanly checkpointed WAL database without usable sidecars may still require this
+administrative preparation before the read-only confined check can succeed.
+
+Schedule and monitor checkpoints through trusted administration/writer composition;
+long-lived readers can prevent completion. Before cold-file backup or restore, stop
+all connections, perform and verify a complete SQLite checkpoint (for example
+`PRAGMA wal_checkpoint(TRUNCATE)` with no busy readers), and close cleanly. Prefer
+the SQLite backup API for consistent online backups. Never copy only a live main
+file, delete WAL/SHM to repair failures, or discard committed uncheckpointed frames.
+Retain the original database and sidecars for recovery assessment. Restore to a
+temporary location first, verify integrity, foreign keys, schema and exact active
+policy generation, and review authorization-history rollback risks before replacing
+production state. Recheck modes and run confined preflight before reopening admission.
 
 ## Preflight confinement and limits
 
