@@ -1,5 +1,9 @@
 # Internal approval persistence (Milestone 6.3B-1)
 
+The persistence contract below is preserved. The subsequent 6.3B-2A protected
+loader and authenticated health transport are documented in
+[local authenticated admission](approval-socket.md); neither dispatches decisions.
+
 Schema 10 adds an initially empty, append-only policy-generation ledger to schema 9.
 Migration installs no policy and grants no authority. Approval records remain append-only,
 and the database approval trigger remains unchanged. Preparation, frozen artifacts,
@@ -14,7 +18,8 @@ explicit assertion boundary for trusted in-process code. It returns an immutable
 validated numeric UID, principal, and `os_peer_credentials` method. **The typed
 object does not authenticate an operator.** Its factory must only be called after
 an authenticated adapter has obtained kernel peer credentials and selected the
-policy-bound principal. No adapter or socket service exists in this milestone.
+policy-bound principal. The 6.3B-1 persistence layer supplies no adapter; the
+subsequent health-only adapter is described in the linked admission document.
 There is no approval CLI, environment identity inference, or client actor override.
 Python code running inside this process is trusted; objects cannot protect against
 hostile Python code or a privileged database writer.
@@ -29,8 +34,8 @@ administrative in-process API**, not an authenticated endpoint. Only protected
 application composition may call it after authenticating administrative authority
 and obtaining policy from a protected administrator-owned source. Never dispatch
 this API using operator request data. Python code in the process and database
-writers remain trusted. No policy loader, administrator authentication adapter,
-rotation CLI or environment override is provided here.
+writers remain trusted. The persistence layer supplies no administrator
+authentication adapter, rotation CLI, or environment override. The subsequent protected loader does not install policy.
 
 Installation uses `BEGIN IMMEDIATE`: `expected_generation=None` explicitly
 bootstraps an empty ledger; rotation requires the exact current positive generation.
@@ -133,9 +138,8 @@ need a new claim and never enables a resend.
 
 A default Store has no active policy and fails closed on any otherwise eligible
 claim. Consequently the ordinary production CLI cannot initiate publication in
-this stage, even if a durable approval was manually inserted. Secure policy loading
-and authenticated request admission remain for 6.3B-2; no permissive default, policy
-label argument or environment override bypass exists. Already published results
+this stage, even if a durable approval was manually inserted. Approval mutation
+dispatch remains for 6.3B-2B; no permissive default, policy label argument or environment override bypass exists. Already published results
 and uncertain-outcome reconciliation preserve their existing behavior.
 
 Historical schema/service tests use `tests.review_helpers.LegacyClaimStore`, an
@@ -147,11 +151,11 @@ covers the full new gate and manual publication with valid preparation and polic
 
 ## Remaining boundaries
 
-There is no operator authentication implementation, Unix socket, policy deployment
-integration, CLI decision operation, automatic publication or remediation, new
-runtime dependency, or production infrastructure change. Kernel credential
-verification, socket permissions, protected policy lifecycle and service ownership
-are required before exposing these APIs to operators. Checksums detect stored
+The subsequent 6.3B-2A adds protected loading and kernel-authenticated Unix socket
+health admission. Approval mutation dispatch, policy deployment integration, CLI
+decision operations, automatic publication, and remediation remain absent. There
+is no new runtime dependency or production infrastructure change. Deployment
+ownership and permissions remain administrative responsibilities. Checksums detect stored
 inconsistency; they do not authenticate a database against an actor able to rewrite
 all artifacts and bindings. Publication credentials and the production assurance
 platform remain operationally separate from approval decisions.

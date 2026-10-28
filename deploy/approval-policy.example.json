@@ -1,0 +1,43 @@
+{
+  "approval_provenance": "completed_preparation",
+  "decisions": [
+    "approved",
+    "declined",
+    "revoked"
+  ],
+  "decline_provenance": "verified_evidence",
+  "principals": [
+    [
+      10001,
+      "example:operator"
+    ]
+  ],
+  "reason_requirements": [
+    [
+      "approved",
+      []
+    ],
+    [
+      "declined",
+      [
+        "incorrect_payload",
+        "operator_declined",
+        "policy"
+      ]
+    ],
+    [
+      "revoked",
+      [
+        "incorrect_payload",
+        "operator_revoked",
+        "policy"
+      ]
+    ]
+  ],
+  "renderer_version": "soc-case/2",
+  "revocation_provenance": "verified_evidence",
+  "targets": [
+    "https://example.test/default/securitySolution"
+  ],
+  "version": "example-review/1"
+}

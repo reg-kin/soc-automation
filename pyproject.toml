@@ -21,6 +21,7 @@ soc_automation = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["unix_socket: permit only local AF_UNIX stream sockets; IP and DNS remain blocked"]
 
 [tool.ruff]
 target-version = "py311"
