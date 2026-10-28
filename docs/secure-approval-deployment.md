@@ -338,3 +338,38 @@ No two-party barrier runs inside competing write transactions. Waits are bounded
 cleanup releases workers/locks, and this test uses a generous local deadline;
 production deadline tests remain separate. The original intermittent failure
 trace was unavailable, so its root cause has not been proven.
+
+## Administrative evidence foundation (Phase 2B-2)
+
+Internal protected locking and metadata evidence now exist in
+`policy_admin_fs.py`; see [policy administration](policy-administration.md#implemented-protected-evidence-primitives-phase-2b-2)
+for the schema, crash behavior and trust boundary. Production paths remain
+`/var/lib/soc-policy-admin/admin.lock` and
+`/var/lib/soc-policy-admin/operations/`. Both real and effective UID 0 are
+required, with root-owned protected ancestors, 0700 private directories and 0600
+single-link regular files. The persistent lock inode is never removed or replaced.
+An exclusive nonblocking advisory lock covers the entire internal context.
+Contexts and evidence handles are bound to their creating PID. Python at-fork
+callbacks serialize with internal operations and close module-owned inherited
+descriptors in the child without unlocking the parent's shared flock. Child
+context exit skips parent-owned descriptors. Thus inherited handles cannot act
+or prolong lock retention; fresh child acquisition still respects contention.
+PID checks alone would not close inherited descriptors. Callback registration
+must succeed before administration is allowed; callback close failure terminates
+the child. Native forks bypassing Python callbacks and external manipulation of
+private descriptors are outside the supported guarantee.
+It provides no maintenance gate or database-writer exclusion.
+
+Manifest updates use temporary creation, file fsync, atomic rename and directory
+fsync. Missing/truncated/contradictory evidence and interrupted temporary files
+block new preparation. Completed evidence also blocks preparation: only empty
+history permits it until authoritative admission verification exists. Manifest
+contents, timestamps and status labels cannot establish ledger authority.
+Completed evidence is never proof of ledger commit or live policy verification.
+Private-directory creation fsyncs the parent even when the child already exists;
+a retry cannot skip a parent fsync that previously failed. Failures propagate
+without a durability success claim or evidence removal. No recovery, abandonment, evidence cleanup or service
+resumption is automated. Explicit maintenance gating and recovery procedures need
+separate implementation and review. The CLI is unchanged: install, rotate and
+recover remain unavailable. No privileged installation or deployment is enabled,
+and this slice requires no host configuration changes or service actions.

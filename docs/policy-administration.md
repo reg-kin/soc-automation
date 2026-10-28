@@ -1,4 +1,4 @@
-# Trusted policy administration foundation — Phase 2B-1
+# Trusted policy administration foundation — Phase 2B-2
 
 ## Scope and implementation status
 
@@ -6,8 +6,9 @@ Implemented: `inspect_policy_ledger(store, *, deadline=None)` in
 `approval_policy.py`, immutable `PolicyLedger` / `PolicyGeneration` results,
 shared runtime history validation, raw/canonical size guards, and the separate
 root-only read-only `soc-policy-admin` CLI described below. No administrative
-daemon, socket, privileged writer, manifest writer, staging, replacement, recovery,
-or deployment action is implemented. Mutation interfaces below remain a design
+daemon, socket, privileged policy writer, staging, policy replacement, recovery,
+or deployment action is implemented. Internal lock and metadata-manifest primitives
+are implemented in `policy_admin_fs.py`; the CLI does not invoke them. Mutation interfaces below remain a design
 contract for subsequent review; their CLI commands explicitly refuse execution.
 
 There is one authoritative SQLite database, one trusted soc-automation writer UID,
@@ -226,8 +227,8 @@ The existing ledger stores generation/version/content/digest/time, not a signed
 administrator identity. Do not claim cryptographic nonrepudiation or expand the
 policy schema to simulate it.
 
-Remaining stages implement and review argument parsing, root maintenance gating,
-lock/evidence durability, protected staging, service-UID child/CAS protocol,
+Remaining stages implement and review root maintenance gating,
+protected staging, service-UID child/CAS protocol,
 replacement, explicit recovery and final verification. No Phase 2A component
 provides these privileged lifecycle guarantees yet.
 
@@ -352,3 +353,109 @@ constructors and production-path opens, and verifies installed-package imports.
 This exercises JSON dispatch, malformed arguments, disabled installation and
 exit-code propagation without real root or persistent state. The existing project
 virtual environment and host installation are not modified.
+
+## Implemented protected evidence primitives (Phase 2B-2)
+
+`policy_admin_fs.administration()` is an internal context manager with no path or
+owner override. It requires both real and effective UID 0 before filesystem
+access. It walks `/`, `var`, `lib`, and `soc-policy-admin` with pinned directory
+descriptors, descriptor-relative opens and `O_NOFOLLOW`. Ancestors must be
+root-owned and lack group/other write permission. The administration directory
+and `operations` directory require exactly 0700; files require exactly 0600,
+root ownership, regular-file type and one hardlink. Missing private directories
+are created and their parent directories fsynced. The parent is also fsynced
+when the private directory already exists, so a retry after successful mkdir
+and failed parent fsync cannot skip durability. Every fsync failure propagates;
+existing evidence is retained. Unsafe existing paths are
+rejected rather than repaired. Every held path binding is checked before and
+after protected work, including inode/device identity and ownership/mode.
+
+The fixed lock is `/var/lib/soc-policy-admin/admin.lock`; evidence is below
+`/var/lib/soc-policy-admin/operations/`. There are no environment overrides.
+The persistent lock inode is opened without truncation or following symlinks,
+validated, and locked using Linux `flock(LOCK_EX | LOCK_NB)`. Contention raises
+`BlockingIOError`. The descriptor stays open through the entire yielded context,
+including evidence reads/writes and caller work, and closes on all exit paths.
+The implementation never unlinks or replaces the lock. Lock and directory fsync
+precede use. This advisory lock excludes cooperating administrators only; it does
+not lock SQLite, stop services, exclude root, or establish maintenance admission.
+Root-controlled namespace stability and a trusted local filesystem remain
+assumptions; rechecks detect observable replacement but cannot prevent a hostile
+root from changing names between syscalls or restoring them between checks.
+
+Contexts and evidence handles record their creating PID. Inherited handles reject
+all operations, including discovery, preparation and updates. A module-scoped
+reentrant fork barrier serializes Python `os.register_at_fork` callbacks with
+context setup/cleanup and evidence operations. The child callback closes every
+module-owned inherited descriptor, including the flock descriptor, without
+issuing `LOCK_UN`. Closing the child's reference leaves the parent's lock intact
+and prevents a living child from prolonging it after parent context exit. PID
+checks alone would not prevent descriptor retention. Child context cleanup skips
+parent-owned descriptor numbers, which may already have been reused. Fresh child
+contexts acquire their own nonblocking lock and respect parent contention.
+Unavailable callback registration rejects administration before filesystem access;
+a child descriptor-close failure exits the child rather than ignoring a callback
+exception. The supported fork path is Python's callback-aware fork, without
+external duplication/closure of private descriptors or native forks bypassing
+Python callbacks. Arbitrary native forks are outside this guarantee.
+
+The context yields an internal `_Evidence` handle:
+
+* `discover()` returns an ID-to-classification mapping. Empty means no operation;
+  valid `completed` evidence is distinct from `unresolved` prepared evidence and
+  `corrupt` evidence. Unsafe entries, invalid IDs, missing manifests, unknown
+  files, interrupted temporary files, or contradictory IDs are corrupt.
+* `prepare(manifest)` refuses any previous operation evidence, including completed,
+  unresolved and corrupt entries, validates metadata,
+  and exclusively creates a new operation directory. IDs use the CLI's bounded
+  ASCII operation-ID grammar. Existing IDs are never reused, including completed
+  IDs. Directory creation is fsynced before manifest writing.
+* `update(manifest)` preserves every metadata field and accepts updates only
+  from prepared evidence. A completed state is an assertion by trusted internal
+  caller code, requiring independently established authority in any future
+  integration. No completion proof or ledger reconciliation exists in this slice.
+
+Manifest schema version 1 has exactly `version`, `operation_id`, `operation`
+(`install` or `rotate`), `change_reference`, `state` (`prepared` or `completed`),
+`expected_generation`, `expected_current_sha256`, `candidate_sha256`,
+`candidate_version`, and `candidate_size`. Candidate metadata describes canonical
+UTF-8 policy bytes: lowercase SHA-256, exact version (1–256 UTF-8 bytes, no control
+characters), and size (1–65536 bytes). The caller supplies validated canonical
+metadata; these primitives neither read nor stage candidate content and cannot
+verify its digest. Install requires expected generation 0 and null current digest;
+rotate requires a positive generation below 9223372036854775807 and an explicit
+current digest. No implicit generation/digest inference occurs.
+
+Manifests are at most 4096 bytes, use compact sorted JSON on write, and reject
+unknown/missing fields, duplicate keys, invalid types (including boolean integers),
+inconsistent expectations, unsupported versions and malformed states on read.
+Discovery bounds operations to 1024, failing closed above that limit. It reads at
+most 4097 manifest bytes and inspects at most two entries inside an operation
+directory before rejecting extra evidence. It checks file identity and metadata
+around reading. The handle rejects use after context exit.
+
+Each update creates a random exclusive no-follow temporary file in the operation
+directory, writes all bytes, fsyncs the file, atomically renames it to
+`manifest.json`, then fsyncs the directory. Readers see the old or new complete
+manifest under the cooperating lock. An exception never reports durable success.
+Before rename, an interrupted temporary file remains as blocking corrupt evidence;
+a newly created empty operation directory also blocks. After rename but before
+successful directory fsync, visibility and reboot durability differ: discovery
+classifies the bytes actually present, and cannot reconstruct whether fsync
+previously succeeded. After reboot either the prior or replacement evidence may
+survive according to filesystem guarantees. Completed evidence never proves a
+SQLite commit, live-file agreement, or permission to resume service.
+
+No automatic cleanup, abandonment, recovery, ledger access, policy-file access,
+policy staging, maintenance gating, privilege-dropping child, or installation is
+provided. Only empty operation history permits preparation. Any prior evidence
+blocks further preparation until authoritative admission verification is implemented
+and independently reviewed. No manifest label, timestamp or manifest content
+establishes a committed generation or ledger authority; there is no override. Do not
+remove evidence to bypass this block. Recovery and admission procedures remain
+deferred; install, rotate and recover remain disabled in the CLI. The private
+`_locked_at` descriptor seam exists for disposable filesystem unit tests, not as a
+configurable production trust boundary. Tests substitute fixture ownership and
+identity and do not need actual root privileges. Unit fault injection cannot
+establish power-loss durability, deployed permissions or filesystem lock support;
+independent review and future host acceptance are still required.
