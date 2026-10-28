@@ -1,5 +1,6 @@
 """Transactional persistent state and migration ownership."""
 
+import hashlib
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -16,7 +17,7 @@ TRANSITIONS = {
     "completed": frozenset(),
     "failed": frozenset(),
 }
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class StateError(RuntimeError):
@@ -39,6 +40,19 @@ def _identifier(value: str, maximum: int) -> str:
     return value
 
 
+def _canonical_case_target(value):
+    """Validate the existing canonical destination format at the SQL boundary."""
+    from soc_automation.config import ConfigurationError, KibanaTargetSettings
+
+    suffix = "/default/securitySolution"
+    if not isinstance(value, str) or not value.endswith(suffix):
+        return False
+    try:
+        return KibanaTargetSettings(value[:-len(suffix)]).target == value
+    except (ConfigurationError, ValueError, TypeError):
+        return False
+
+
 class Store:
     def __init__(self, path: Path, timeout: int = 5):
         self.path = Path(path)
@@ -55,6 +69,14 @@ class Store:
         connection = sqlite3.connect(target, uri=True, timeout=self.timeout, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.create_function("coordination_now", 0, time.time)
+        connection.create_function(
+            "sha256_text",
+            1,
+            lambda value: hashlib.sha256(value.encode()).hexdigest(),
+            deterministic=True,
+        )
+        connection.create_function("canonical_case_target", 1, _canonical_case_target,
+                                   deterministic=True)
         try:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA synchronous=FULL")
@@ -95,6 +117,29 @@ class Store:
         if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise StateError("Database must be initialized with a supported schema")
         expected = {
+            "case_preparation_jobs",
+            "case_preparation_ready",
+            "case_preparation_publication",
+            "case_preparation_audit",
+            "case_preparation_audit_job",
+            "preparation_initial",
+            "preparation_identity",
+            "preparation_transition",
+            "preparation_completion",
+            "preparation_audit_insert",
+            "preparation_audit_transition",
+            "preparation_audit_guard",
+            "review_sequence",
+            "case_review_events",
+            "case_review_publication",
+            "review_initial",
+            "publication_approval_guard",
+            "publication_head_insert",
+            "preparation_no_delete",
+            "preparation_audit_no_update",
+            "preparation_audit_no_delete",
+            "review_no_update",
+            "review_no_delete",
             "investigation_job_report_initial",
             "investigation_job_report_guard",
             "investigation_jobs_ready",

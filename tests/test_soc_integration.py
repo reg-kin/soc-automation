@@ -177,7 +177,7 @@ def assert_completed(j, job):
 def test_pipeline_restart_idempotency_and_frozen_local_case(journey):
     j = journey
     with j.store._connection(readonly=True) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
     for identifier in j.ids:
         alert = j.store.show_alert(identifier, evidence=True)
         assert alert["decision"]["priority"] == "P2"

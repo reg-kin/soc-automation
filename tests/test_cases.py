@@ -42,6 +42,9 @@ def prepared(tmp_path):
         find=Mock(),
         get=Mock(),
     )
+    from review_helpers import approve
+
+    approve(store, row["id"])
     return store, report, row, client
 
 
@@ -478,6 +481,9 @@ def test_revisions_preserve_frozen_rows_and_block_superseded(prepared):
             "WHERE id=?",
             (old["id"],),
         )
+    from review_helpers import approve
+
+    approve(store, new["id"])
     assert store.claim_publication(new["id"], new["payload_sha256"])
     payload["description"] += "\nThird version"
     payload["tags"] = ["soc-publication-" + digest(payload)]
