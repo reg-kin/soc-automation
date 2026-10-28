@@ -11,3 +11,24 @@ dist/
 .env
 *.db
 *.db-*
+
+# Local environment and credentials
+.env.*
+!.env.example
+/certs/
+/.codex/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# Local SQLite databases and sidecars
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Local runtime state
+/state/
