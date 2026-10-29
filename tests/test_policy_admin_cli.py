@@ -79,6 +79,12 @@ def test_unavailable(operation, capsys, monkeypatch, tmp_path):
         args += ['--expected-current-sha256', 'a' * 64]
     monkeypatch.setattr(cli, 'Store', lambda *a: pytest.fail('state accessed'))
     monkeypatch.setattr(PolicySource, 'read_candidate', lambda *a: pytest.fail('file accessed'))
+    from soc_automation import policy_admin_fs
+
+    monkeypatch.setattr(policy_admin_fs, 'administration',
+                        lambda: pytest.fail('staging accessed'))
+    monkeypatch.setattr(policy_admin_fs, '_source_bytes',
+                        lambda *a: pytest.fail('candidate accessed'))
     value = reply(capsys, cli.main(args), 4)
     assert value['error'] == 'maintenance_required'
     assert value['operation'] is None

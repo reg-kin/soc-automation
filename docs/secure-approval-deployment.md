@@ -339,10 +339,10 @@ cleanup releases workers/locks, and this test uses a generous local deadline;
 production deadline tests remain separate. The original intermittent failure
 trace was unavailable, so its root cause has not been proven.
 
-## Administrative evidence foundation (Phase 2B-2)
+## Protected administrative staging (Phase 2B-3)
 
-Internal protected locking and metadata evidence now exist in
-`policy_admin_fs.py`; see [policy administration](policy-administration.md#implemented-protected-evidence-primitives-phase-2b-2)
+Internal protected locking, immutable candidate staging and metadata evidence exist in
+`policy_admin_fs.py`; see [policy administration](policy-administration.md#implemented-protected-evidence-primitives-phase-2b-3)
 for the schema, crash behavior and trust boundary. Production paths remain
 `/var/lib/soc-policy-admin/admin.lock` and
 `/var/lib/soc-policy-admin/operations/`. Both real and effective UID 0 are
@@ -373,3 +373,40 @@ resumption is automated. Explicit maintenance gating and recovery procedures nee
 separate implementation and review. The CLI is unchanged: install, rotate and
 recover remain unavailable. No privileged installation or deployment is enabled,
 and this slice requires no host configuration changes or service actions.
+
+New internal preparations require manifest schema version 2 and exactly
+`candidate.json` plus `manifest.json` in the protected operation directory.
+Version-1 manifests retain legacy metadata-only discovery semantics and block
+new preparation, but can never be read as staged candidates. Generation and
+current-digest fields are explicit caller expectations, not verified authority.
+
+Staging uses the existing authoritative policy parser and canonical serializer:
+all fields and tuple order are preserved, frozensets and keys are sorted, JSON
+is compact with ASCII escaping, and UTF-8 bytes have no trailing newline. Raw
+and canonical limits are each inclusive 65,536 bytes. The exact candidate
+version, lowercase SHA-256 and size are bound to the manifest and operation ID.
+The source is read through pinned, root-owned protected ancestors, with no-follow
+opens, bounded reads and metadata/path rechecks. Explicitly opened descriptors
+participate in registration and child cleanup. Enumeration may create
+runtime-owned descriptor aliases outside that registry. An unsafe transition
+boundary spans iterator construction, iteration and close, including exceptions;
+a child forked during that lifetime terminates before returning from its Python
+at-fork callback. Other threads wait at the existing fork barrier. Lock lifetime
+is unchanged. Native forks bypassing Python callbacks remain excluded.
+
+Persistence order is source/manifest validation, history rejection, exclusive
+operation-directory creation, operations-directory fsync, exclusive candidate
+creation, full write and candidate fsync, writable close, operation-directory
+fsync, read-only reopen and verification, then atomic durable manifest publication
+and final binding verification. The candidate is root-owned, exactly 0600 and a
+single-link regular file. Manifest updates verify and preserve candidate bytes.
+Version-2 discovery verifies the candidate before reporting completed or unresolved;
+missing, modified, noncanonical or mismatched bytes and unexpected entries are
+corrupt evidence. Completion remains only a local assertion.
+
+Every post-creation failure retains incomplete blocking evidence and propagates;
+there is no automatic cleanup, retry into existing operations, abandonment,
+repair or inferred installation. Crash visibility does not prove prior fsync
+success or durable ledger authority. Trusted root and local filesystem guarantees
+remain assumptions. Installation, rotation, recovery and publication remain
+deferred; this phase changes no service, host configuration or production policy.

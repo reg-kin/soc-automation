@@ -1,5 +1,6 @@
 """Disposable descriptor fixtures; no root privileges or production access required."""
 
+import hashlib
 import json
 import os
 from contextlib import contextmanager
@@ -7,6 +8,17 @@ from contextlib import contextmanager
 import pytest
 
 from soc_automation import policy_admin_fs as fs
+from soc_automation.approval import ReviewPolicy, _policy_content
+
+
+def canonical():
+    return _policy_content(ReviewPolicy(
+        'review/1', ((1000, 'operator:test'),),
+        frozenset({'https://example.test/default/securitySolution'}))).encode()
+
+
+def prepare(evidence, value):
+    evidence.prepare(value, '/source.json')
 
 
 @pytest.fixture
@@ -24,6 +36,16 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(fs.os, 'getuid', lambda: 0)
     monkeypatch.setattr(fs.os, 'geteuid', lambda: 0)
     tmp_path.chmod(0o700)
+    (tmp_path / 'source.json').write_bytes(canonical())
+    (tmp_path / 'source.json').chmod(0o600)
+    original_open = os.open
+
+    def fixture_open(name, *args, **kwargs):
+        # The source reader still walks and validates every component; only its
+        # root is redirected to a disposable directory, avoiding unsafe /tmp.
+        return original_open(tmp_path if name == '/' else name, *args, **kwargs)
+
+    monkeypatch.setattr(fs.os, 'open', fixture_open)
     fd = os.open(tmp_path, fs.DIR_FLAGS)
     try:
         yield tmp_path, fd
@@ -32,9 +54,10 @@ def sandbox(tmp_path, monkeypatch):
 
 
 def manifest(name='op-1'):
-    return dict(version=1, operation_id=name, operation='install', change_reference='CHG:1',
+    return dict(version=2, operation_id=name, operation='install', change_reference='CHG:1',
                 state='prepared', expected_generation=0, expected_current_sha256=None,
-                candidate_sha256='a' * 64, candidate_version='review/1', candidate_size=123)
+                candidate_sha256=hashlib.sha256(canonical()).hexdigest(),
+                candidate_version='review/1', candidate_size=len(canonical()))
 
 
 def locked(sandbox):
@@ -108,25 +131,25 @@ def test_unsafe_owner(kind, sandbox, monkeypatch):
 def test_ids(sandbox, name):
     with locked(sandbox) as evidence:
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(manifest(name))
+            prepare(evidence, manifest(name))
         assert evidence.discover() == {}
 
 
 def test_lifecycle_exclusivity_and_immutable_metadata(sandbox):
     with locked(sandbox) as evidence:
         value = manifest()
-        evidence.prepare(value)
+        prepare(evidence, value)
         assert evidence.discover() == {'op-1': 'unresolved'}
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(manifest('op-2'))
+            prepare(evidence, manifest('op-2'))
         with pytest.raises(fs.EvidenceError):
             evidence.update(dict(value, candidate_sha256='b' * 64, state='completed'))
         evidence.update(dict(value, state='completed'))
         assert evidence.discover() == {'op-1': 'completed'}
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(value)
+            prepare(evidence, value)
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(manifest('op-2'))
+            prepare(evidence, manifest('op-2'))
     with locked(sandbox) as evidence:
         assert evidence.discover() == {'op-1': 'completed'}
 
@@ -136,15 +159,15 @@ def test_lifecycle_exclusivity_and_immutable_metadata(sandbox):
 def test_corrupt_manifest(sandbox, damage):
     path, _ = sandbox
     with locked(sandbox) as evidence:
-        evidence.prepare(manifest())
+        prepare(evidence, manifest())
         (path / 'operations/op-1/manifest.json').write_bytes(damage)
         assert evidence.discover() == {'op-1': 'corrupt'}
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(manifest('op-2'))
+            prepare(evidence, manifest('op-2'))
 
 
 @pytest.mark.parametrize('changes', [
-    {'version': True}, {'version': 2}, {'state': 'committed'}, {'extra': 'x'},
+    {'version': True}, {'version': 3}, {'state': 'committed'}, {'extra': 'x'},
     {'operation': 'recover'}, {'expected_generation': True}, {'expected_generation': 1},
     {'expected_current_sha256': 'a' * 64}, {'candidate_size': 65537},
     {'candidate_sha256': 'A' * 64}, {'candidate_version': 'x' * 257},
@@ -153,14 +176,14 @@ def test_corrupt_manifest(sandbox, damage):
 def test_strict_manifest(sandbox, changes):
     with locked(sandbox) as evidence:
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(dict(manifest(), **changes))
+            prepare(evidence, dict(manifest(), **changes))
         assert evidence.discover() == {}
 
 
 def test_contradictory_identity_and_extra_entries(sandbox):
     path, _ = sandbox
     with locked(sandbox) as evidence:
-        evidence.prepare(manifest())
+        prepare(evidence, manifest())
         target = path / 'operations/op-1/manifest.json'
         target.write_text(json.dumps(manifest('different')))
         assert evidence.discover() == {'op-1': 'corrupt'}
@@ -174,7 +197,7 @@ def test_failed_atomic_update_blocks(sandbox, monkeypatch, failure):
     path, _ = sandbox
     with locked(sandbox) as evidence:
         value = manifest()
-        evidence.prepare(value)
+        prepare(evidence, value)
         target = path / 'operations/op-1/manifest.json'
         original = target.read_bytes()
         fsync = os.fsync
@@ -202,13 +225,13 @@ def test_failed_atomic_update_blocks(sandbox, monkeypatch, failure):
             # Rename is visible, but failed fsync was never reported as durable success.
             assert evidence.discover() == {'op-1': 'completed'}
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(manifest('op-2'))
+            prepare(evidence, manifest('op-2'))
 
 
 def test_atomic_order_and_replacement(sandbox, monkeypatch):
     path, _ = sandbox
     with locked(sandbox) as evidence:
-        evidence.prepare(manifest())
+        prepare(evidence, manifest())
         target = path / 'operations/op-1/manifest.json'
         inode = target.stat().st_ino
         events = []
@@ -279,9 +302,10 @@ def test_no_database_or_policy_access(sandbox, monkeypatch):
 
     monkeypatch.setattr(fs.os, 'open', tracked)
     with locked(sandbox) as evidence:
-        evidence.prepare(manifest())
+        prepare(evidence, manifest())
         evidence.discover()
-    assert all(name in ('admin.lock', 'operations', 'op-1', 'manifest.json')
+    assert all(name in ('/', 'source.json', 'candidate.json',
+                               'admin.lock', 'operations', 'op-1', 'manifest.json')
                or name.startswith('.manifest-') for name in names)
 
 
@@ -336,7 +360,7 @@ def test_cross_process_lock(sandbox):
 def test_manifest_filesystem_attacks(sandbox, damage):
     path, _ = sandbox
     with locked(sandbox) as evidence:
-        evidence.prepare(manifest())
+        prepare(evidence, manifest())
         target = path / 'operations/op-1/manifest.json'
         if damage == 'symlink':
             target.rename(path / 'other')
@@ -349,18 +373,18 @@ def test_manifest_filesystem_attacks(sandbox, damage):
             target.unlink()
         assert evidence.discover() == {'op-1': 'corrupt'}
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(manifest('op-2'))
+            prepare(evidence, manifest('op-2'))
 
 
 def test_rotate_expectations_and_evidence_bound(sandbox, monkeypatch):
     value = dict(manifest(), operation='rotate', expected_generation=1,
                  expected_current_sha256='b' * 64)
     with locked(sandbox) as evidence:
-        evidence.prepare(value)
+        prepare(evidence, value)
         evidence.update(dict(value, state='completed'))
         monkeypatch.setattr(fs, 'OPERATION_LIMIT', 0)
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(manifest('op-2'))
+            prepare(evidence, manifest('op-2'))
 
 
 def test_interrupted_initial_manifest(sandbox, monkeypatch):
@@ -372,11 +396,12 @@ def test_interrupted_initial_manifest(sandbox, monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(fs.os, 'write', fail)
             with pytest.raises(OSError):
-                evidence.prepare(manifest())
+                prepare(evidence, manifest())
         assert evidence.discover() == {'op-1': 'corrupt'}
-        assert any(p.name.startswith('.manifest-') for p in (path / 'operations/op-1').iterdir())
+        assert (path / 'operations/op-1/candidate.json').exists()
+        assert not (path / 'operations/op-1/manifest.json').exists()
         with pytest.raises(fs.EvidenceError):
-            evidence.prepare(manifest('op-2'))
+            prepare(evidence, manifest('op-2'))
 
 
 @pytest.mark.parametrize('name', ['operations', 'soc-policy-admin'])
@@ -431,7 +456,7 @@ def test_inherited_handle_cleanup_and_lock_lifetime(sandbox, monkeypatch):
     def child():
         try:
             for operation in (evidence.discover,
-                              lambda: evidence.prepare(manifest('child')),
+                              lambda: prepare(evidence, manifest('child')),
                               lambda: evidence.update(manifest()),
                               lambda: evidence._read(-1, 'op-1'),
                               lambda: evidence._write(-1, b'')):
@@ -452,7 +477,7 @@ def test_inherited_handle_cleanup_and_lock_lifetime(sandbox, monkeypatch):
             child_send.send('rejected')
             assert child_receive.recv() == 'parent preparing'
             with pytest.raises(fs.EvidenceError, match='Inherited'):
-                evidence.prepare(manifest('concurrent-child'))
+                prepare(evidence, manifest('concurrent-child'))
             child_send.send('concurrent prepare rejected')
             assert child_receive.recv() == 'parent exited'
             with locked(sandbox) as fresh:
@@ -480,7 +505,7 @@ def test_inherited_handle_cleanup_and_lock_lifetime(sandbox, monkeypatch):
             write(directory, data)
 
         monkeypatch.setattr(evidence, '_write', during_parent_prepare)
-        evidence.prepare(manifest())
+        prepare(evidence, manifest())
         manager.__exit__(None, None, None)
         # Child stays alive with its inherited handle: it cannot retain flock.
         with locked(sandbox):
@@ -744,3 +769,737 @@ def test_nested_contexts_fork_cleanup(sandbox):
             pass
     finally:
         os.close(nested)
+
+
+@pytest.mark.parametrize('changes', [
+    {'candidate_sha256': '0' * 64}, {'candidate_version': 'review/2'},
+    {'candidate_size': 1}, {'version': 1},
+])
+def test_candidate_expectations_before_creation(sandbox, changes):
+    with locked(sandbox) as evidence:
+        with pytest.raises(fs.EvidenceError):
+            prepare(evidence, dict(manifest(), **changes))
+        assert list((sandbox[0] / 'operations').iterdir()) == []
+
+
+def test_canonical_equivalence_and_tuple_order(sandbox):
+    path, _ = sandbox
+    value = json.loads(canonical())
+    value['principals'] = [[1001, 'operator:second'], [1000, 'operator:first']]
+    value['reason_requirements'].reverse()
+    value['decisions'].reverse()
+    value['version'] = 'review/1'
+    raw = json.dumps(value, indent=2, ensure_ascii=False).encode()
+    policy, expected = fs._canonical(raw)
+    (path / 'source.json').write_bytes(raw)
+    metadata = dict(manifest(), candidate_version=policy.version,
+                    candidate_size=len(expected),
+                    candidate_sha256=hashlib.sha256(expected).hexdigest())
+    with locked(sandbox) as evidence:
+        prepare(evidence, metadata)
+        assert evidence.read_candidate('op-1') == expected
+        assert expected.isascii() and not expected.endswith(b'\n')
+        assert json.loads(expected)['principals'] == value['principals']
+        assert json.loads(expected)['reason_requirements'] == value['reason_requirements']
+        target = path / 'operations/op-1/candidate.json'
+        before = target.stat()
+        evidence.update(dict(metadata, state='completed'))
+        after = target.stat()
+        assert (before.st_ino, before.st_mtime_ns, before.st_ctime_ns) == (
+            after.st_ino, after.st_mtime_ns, after.st_ctime_ns)
+        assert target.read_bytes() == expected
+        assert after.st_mode & 0o7777 == 0o600
+        assert after.st_nlink == 1
+
+
+@pytest.mark.parametrize('raw', [b'{', b'{}', b'\xff',
+                                 canonical().replace(b'completed_preparation', b'unverified'),
+                                 canonical() + b' ' * 65536])
+def test_invalid_source_before_creation(sandbox, raw):
+    (sandbox[0] / 'source.json').write_bytes(raw)
+    with locked(sandbox) as evidence:
+        with pytest.raises((ValueError, UnicodeError)):
+            prepare(evidence, manifest())
+        assert evidence.discover() == {}
+
+
+@pytest.mark.parametrize('path', ['', '/', 'relative', '/a/', '/a//b', '/./b',
+                                  '/../b', '/a\x00', '/' + 'é' * 2048])
+def test_source_path_contract(sandbox, path):
+    with locked(sandbox) as evidence:
+        with pytest.raises(ValueError):
+            evidence.prepare(manifest(), path)
+        assert evidence.discover() == {}
+
+
+@pytest.mark.parametrize('attack', ['symlink', 'ancestor_symlink', 'ancestor_mode',
+                                    'mode', 'hardlink', 'fifo', 'directory', 'socket'])
+@pytest.mark.unix_socket
+def test_protected_source_attacks(sandbox, attack):
+    import socket
+
+    path, _ = sandbox
+    source = path / 'source.json'
+    source_path = '/source.json'
+    sock = None
+    if attack.startswith('ancestor'):
+        ancestor = path / 'ancestor'
+        ancestor.mkdir(mode=0o700)
+        source.rename(ancestor / 'source.json')
+        source_path = '/ancestor/source.json'
+        if attack == 'ancestor_mode':
+            ancestor.chmod(0o777)
+        else:
+            ancestor.rename(path / 'original')
+            ancestor.symlink_to('original')
+    elif attack == 'symlink':
+        source.rename(path / 'original')
+        source.symlink_to('original')
+    elif attack == 'mode':
+        source.chmod(0o666)
+    elif attack == 'hardlink':
+        os.link(source, path / 'alias')
+    else:
+        source.unlink()
+        if attack == 'fifo':
+            os.mkfifo(source, 0o600)
+        elif attack == 'directory':
+            source.mkdir(mode=0o700)
+        else:
+            sock = socket.socket(socket.AF_UNIX)
+            sock.bind(str(source))
+    try:
+        with locked(sandbox) as evidence:
+            with pytest.raises((ValueError, OSError)):
+                evidence.prepare(manifest(), source_path)
+            assert evidence.discover() == {}
+    finally:
+        if sock:
+            sock.close()
+
+
+@pytest.mark.parametrize('attack', ['replace', 'mutate', 'grow', 'ancestor'])
+def test_source_read_races(sandbox, monkeypatch, attack):
+    path, _ = sandbox
+    ancestor = path / 'ancestor'
+    ancestor.mkdir(mode=0o700)
+    source = ancestor / 'source.json'
+    (path / 'source.json').rename(source)
+    read = os.read
+    armed = True
+
+    def raced(fd, size):
+        nonlocal armed
+        data = read(fd, size)
+        if armed and os.fstat(fd).st_ino == source.stat().st_ino:
+            armed = False
+            if attack == 'replace':
+                source.rename(ancestor / 'old')
+                source.write_bytes(canonical())
+                source.chmod(0o600)
+            elif attack == 'ancestor':
+                ancestor.rename(path / 'old')
+                ancestor.mkdir(mode=0o700)
+            else:
+                source.write_bytes(canonical() + (b' ' if attack == 'grow' else b''))
+        return data
+
+    with locked(sandbox) as evidence:
+        monkeypatch.setattr(fs.os, 'read', raced)
+        with pytest.raises((ValueError, OSError)):
+            evidence.prepare(manifest(), '/ancestor/source.json')
+        assert evidence.discover() == {}
+
+
+def test_short_reads_and_partial_writes(sandbox, monkeypatch):
+    read, write = os.read, os.write
+    monkeypatch.setattr(fs.os, 'read', lambda fd, size: read(fd, min(7, size)))
+    monkeypatch.setattr(fs.os, 'write', lambda fd, data: write(fd, data[:5]))
+    with locked(sandbox) as evidence:
+        prepare(evidence, manifest())
+        assert evidence.read_candidate('op-1') == canonical()
+
+
+@pytest.mark.parametrize('boundary', range(1, 6))
+def test_staging_fsync_failures(sandbox, monkeypatch, boundary):
+    path, _ = sandbox
+    with locked(sandbox) as evidence:
+        sync = os.fsync
+        calls = 0
+
+        def failed(fd):
+            nonlocal calls
+            calls += 1
+            if calls == boundary:
+                raise OSError('injected staging fsync')
+            sync(fd)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(fs.os, 'fsync', failed)
+            with pytest.raises(OSError):
+                prepare(evidence, manifest())
+        assert calls == boundary
+        operation = path / 'operations/op-1'
+        assert operation.is_dir()
+        assert (operation / 'manifest.json').exists() == (boundary == 5)
+        with pytest.raises(fs.EvidenceError):
+            prepare(evidence, manifest('op-2'))
+
+
+@pytest.mark.parametrize('failure', ['zero', 'rename', 'candidate_close', 'verify'])
+def test_staging_publication_failures(sandbox, monkeypatch, failure):
+    path, _ = sandbox
+    with locked(sandbox) as evidence:
+        def fail(*args, **kwargs):
+            raise OSError('injected staging failure')
+
+        with monkeypatch.context() as patch:
+            if failure == 'zero':
+                patch.setattr(fs.os, 'write', lambda *args: 0)
+            elif failure == 'rename':
+                patch.setattr(fs.os, 'rename', fail)
+            elif failure == 'verify':
+                patch.setattr(evidence, '_verify', fail)
+            else:
+                close = os.close
+
+                def closed(fd):
+                    info = os.fstat(fd)
+                    close(fd)
+                    if (fs.stat.S_ISREG(info.st_mode)
+                            and (path / 'operations/op-1/candidate.json').exists()):
+                        fail()
+
+                patch.setattr(fs.os, 'close', closed)
+            with pytest.raises(OSError):
+                prepare(evidence, manifest())
+        assert (path / 'operations/op-1').is_dir()
+        assert not (path / 'operations/op-1/manifest.json').exists()
+        with pytest.raises(fs.EvidenceError):
+            prepare(evidence, manifest('op-2'))
+
+
+@pytest.mark.parametrize('damage', ['missing', 'truncate', 'modify', 'oversize',
+                                    'noncanonical', 'extra', 'symlink', 'hardlink', 'mode'])
+def test_corrupt_candidates(sandbox, damage):
+    path, _ = sandbox
+    with locked(sandbox) as evidence:
+        prepare(evidence, manifest())
+        target = path / 'operations/op-1/candidate.json'
+        if damage == 'missing':
+            target.unlink()
+        elif damage == 'truncate':
+            target.write_bytes(canonical()[:-1])
+        elif damage == 'modify':
+            target.write_bytes(canonical().replace(b'review/1', b'review/2'))
+        elif damage == 'oversize':
+            target.write_bytes(b' ' * 65537)
+        elif damage == 'noncanonical':
+            raw = json.dumps(json.loads(canonical()), indent=1).encode()
+            target.write_bytes(raw)
+            # Even matching metadata cannot make noncanonical bytes acceptable.
+            value = dict(manifest(), candidate_size=len(raw),
+                         candidate_sha256=hashlib.sha256(raw).hexdigest())
+            (target.parent / 'manifest.json').write_bytes(fs._manifest(value))
+        elif damage == 'extra':
+            (target.parent / 'unexpected').touch()
+        elif damage == 'symlink':
+            target.rename(path / 'original')
+            target.symlink_to(path / 'original')
+        elif damage == 'hardlink':
+            os.link(target, path / 'alias')
+        else:
+            target.chmod(0o640)
+        assert evidence.discover() == {'op-1': 'corrupt'}
+        with pytest.raises((ValueError, OSError)):
+            evidence.read_candidate('op-1')
+        with pytest.raises((ValueError, OSError)):
+            evidence.update(dict(manifest(), state='completed'))
+        with pytest.raises(fs.EvidenceError):
+            prepare(evidence, manifest('op-2'))
+
+
+@pytest.mark.parametrize('state', ['prepared', 'completed'])
+def test_legacy_metadata_only(sandbox, state):
+    path, _ = sandbox
+    with locked(sandbox) as evidence:
+        value = dict(manifest(), version=1, state=state)
+        operation = path / 'operations/op-1'
+        operation.mkdir(mode=0o700)
+        (operation / 'manifest.json').write_bytes(fs._manifest(value))
+        (operation / 'manifest.json').chmod(0o600)
+        classification = 'completed' if state == 'completed' else 'unresolved'
+        assert evidence.discover() == {'op-1': classification}
+        with pytest.raises(fs.EvidenceError, match='Legacy'):
+            evidence.read_candidate('op-1')
+        with pytest.raises(fs.EvidenceError):
+            prepare(evidence, manifest('op-2'))
+        if state == 'prepared':
+            evidence.update(dict(value, state='completed'))
+            assert evidence.discover() == {'op-1': 'completed'}
+
+
+def _sized_policy(size):
+    value = json.loads(canonical())
+    value['principals'] = [[uid, 'p' * 240] for uid in range(280)]
+    value['principals'].append([1000, 'p'])
+    data = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+    while len(data) > size:
+        value['principals'].pop(0)
+        data = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+    value['principals'][-1][1] += 'p' * (size - len(data))
+    data = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+    assert len(data) == size
+    return data
+
+
+@pytest.mark.parametrize('size', [65535, 65536, 65537])
+def test_canonical_size_boundary(sandbox, size):
+    raw = _sized_policy(size)
+    (sandbox[0] / 'source.json').write_bytes(raw)
+    value = dict(manifest(), candidate_size=min(size, 65536),
+                 candidate_sha256=hashlib.sha256(raw).hexdigest())
+    with locked(sandbox) as evidence:
+        if size > 65536:
+            with pytest.raises(ValueError):
+                prepare(evidence, value)
+            assert evidence.discover() == {}
+        else:
+            prepare(evidence, value)
+            assert evidence.read_candidate('op-1') == raw
+
+
+@pytest.mark.parametrize('size', [65536, 65537])
+def test_raw_size_boundary(sandbox, size):
+    (sandbox[0] / 'source.json').write_bytes(canonical().ljust(size, b' '))
+    with locked(sandbox) as evidence:
+        if size > 65536:
+            with pytest.raises(ValueError):
+                prepare(evidence, manifest())
+            assert evidence.discover() == {}
+        else:
+            prepare(evidence, manifest())
+            assert evidence.read_candidate('op-1') == canonical()
+
+
+def test_exclusive_candidate_creation(sandbox, monkeypatch):
+    path, _ = sandbox
+    opened = fs._open
+
+    def raced(name, *args, **kwargs):
+        if name == 'candidate.json' and args[0] & os.O_CREAT:
+            target = path / 'operations/op-1/candidate.json'
+            target.write_bytes(b'existing')
+            target.chmod(0o600)
+        return opened(name, *args, **kwargs)
+
+    with locked(sandbox) as evidence:
+        monkeypatch.setattr(fs, '_open', raced)
+        with pytest.raises(FileExistsError):
+            prepare(evidence, manifest())
+        assert (path / 'operations/op-1/candidate.json').read_bytes() == b'existing'
+        assert evidence.discover() == {'op-1': 'corrupt'}
+
+
+def test_premature_eof_rejected(sandbox, monkeypatch):
+    with locked(sandbox) as evidence:
+        monkeypatch.setattr(fs.os, 'read', lambda *args: b'')
+        with pytest.raises(fs.EvidenceError):
+            prepare(evidence, manifest())
+        assert evidence.discover() == {}
+
+
+@pytest.mark.parametrize('stage', ['source', 'candidate'])
+def test_fork_closes_staging_descriptors(sandbox, monkeypatch, stage):
+    read = os.read
+    fired = False
+
+    def forked(fd, size):
+        nonlocal fired
+        if not fired and (stage == 'source' or
+                          (sandbox[0] / 'operations/op-1/candidate.json').exists()):
+            fired = True
+            owned = tuple(fs._owned_fds)
+            pid = os.fork()
+            if pid == 0:
+                if fs._owned_fds:
+                    os._exit(2)
+                for inherited in owned:
+                    try:
+                        os.fstat(inherited)
+                    except OSError:
+                        continue
+                    os._exit(3)
+                os._exit(0)
+            assert _reap(pid) == 0
+        return read(fd, size)
+
+    with locked(sandbox) as evidence:
+        monkeypatch.setattr(fs.os, 'read', forked)
+        prepare(evidence, manifest())
+        assert fired
+        assert evidence.read_candidate('op-1') == canonical()
+
+
+@pytest.mark.parametrize('mode', [0o601, 0o4600, 0o2600, 0o1600, 0o620])
+def test_unsafe_source_modes(sandbox, mode):
+    (sandbox[0] / 'source.json').chmod(mode)
+    with locked(sandbox) as evidence:
+        with pytest.raises(fs.EvidenceError):
+            prepare(evidence, manifest())
+        assert evidence.discover() == {}
+
+
+@pytest.mark.parametrize('stage', ['parse', 'publication'])
+def test_candidate_changed_during_verification(sandbox, monkeypatch, stage):
+    path, _ = sandbox
+    with locked(sandbox) as evidence:
+        prepare(evidence, manifest())
+        candidate = path / 'operations/op-1/candidate.json'
+        if stage == 'parse':
+            binding = fs._binding
+
+            def changed(*args):
+                binding(*args)
+                candidate.write_bytes(canonical())
+
+            monkeypatch.setattr(fs, '_binding', changed)
+            with pytest.raises(fs.EvidenceError):
+                evidence.read_candidate('op-1')
+        else:
+            write = evidence._write
+
+            def replaced(*args):
+                write(*args)
+                candidate.unlink()
+                candidate.write_bytes(canonical())
+                candidate.chmod(0o600)
+
+            monkeypatch.setattr(evidence, '_write', replaced)
+            with pytest.raises(fs.EvidenceError):
+                evidence.update(dict(manifest(), state='completed'))
+
+
+def test_source_ownership(sandbox, monkeypatch):
+    inode = (sandbox[0] / 'source.json').stat().st_ino
+    original = fs.os.fstat
+
+    def wrong_owner(fd):
+        info = original(fd)
+        if info.st_ino == inode:
+            values = list(info)
+            values[4] = 123456
+            return os.stat_result(values)
+        return info
+
+    with locked(sandbox) as evidence:
+        monkeypatch.setattr(fs.os, 'fstat', wrong_owner)
+        with pytest.raises(fs.EvidenceError):
+            prepare(evidence, manifest())
+        assert evidence.discover() == {}
+
+
+def _inode_fds(directory):
+    """Inspect Linux's actual fd table, independently of the module registry."""
+    identity = os.fstat(directory)
+    found = set()
+    for name in os.listdir('/proc/self/fd'):
+        try:
+            info = os.fstat(int(name))
+        except OSError:
+            continue  # The proc enumeration's own descriptor has closed.
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            found.add(int(name))
+    return found
+
+
+def test_runtime_scandir_alias_lifetime(sandbox):
+    _, directory = sandbox
+    before = _inode_fds(directory)
+    iterator = os.scandir(directory)
+    aliases = _inode_fds(directory) - before
+    assert len(aliases) == 1
+    alias = aliases.pop()
+    # A real child inherits this unregistered alias even though callbacks run.
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0 if alias in _inode_fds(directory) else 2)
+    assert _reap(pid) == 0
+    iterator.close()
+    assert _inode_fds(directory) == before
+    with os.scandir(directory) as iterator:
+        assert len(_inode_fds(directory) - before) == 1
+        list(iterator)
+        assert _inode_fds(directory) == before  # Exhaustion releases it too.
+    original = os.dup(directory)
+    iterator = os.scandir(original)
+    os.close(original)
+    try:
+        assert len(_inode_fds(directory) - before) == 1
+        assert list(iterator)
+    finally:
+        iterator.close()
+    assert _inode_fds(directory) == before
+
+
+@pytest.mark.parametrize('operation', ['discover', 'verify', 'lifetime'])
+@pytest.mark.parametrize('stage', ['construct_before', 'construct_after', 'open',
+                                   'iterate', 'close_before', 'close_after', 'signal'])
+def test_enumeration_fork_boundary(sandbox, monkeypatch, operation, stage):
+    import signal
+
+    children = []
+    reports_read, reports_write = os.pipe()
+    real_exit = os._exit
+    real_scandir = os.scandir
+    fired = False
+    target = None
+    expected_alias = False
+
+    def inspected_exit(status):
+        # Runs inside the fatal child callback, before process exit. Confirm the
+        # actual inherited alias is usable; only process termination removes it.
+        aliases = _inode_fds(target) - fs._owned_fds - {target}
+        usable = any(os.stat('.', dir_fd=fd).st_ino == os.fstat(target).st_ino
+                     for fd in aliases)
+        os.write(reports_write, b'A' if usable else b'N')
+        real_exit(status)
+
+    def fork_now(*args):
+        nonlocal fired, expected_alias
+        if fired:
+            return
+        fired = True
+        expected_alias = bool(_inode_fds(target) - fs._owned_fds - {target})
+        pid = os.fork()
+        if pid == 0:
+            os.write(reports_write, b'S')  # A surviving child is always a failure.
+            real_exit(99)
+        children.append(pid)
+
+    class Iterator:
+        def __init__(self, directory):
+            if stage == 'construct_before':
+                fork_now()
+            self.iterator = real_scandir(directory)
+            if stage == 'construct_after':
+                fork_now()
+
+        def __enter__(self):
+            if stage == 'open':
+                fork_now()
+            if stage == 'signal':
+                signal.raise_signal(signal.SIGUSR1)
+            return self
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if stage == 'iterate':
+                fork_now()
+            return next(self.iterator)
+
+        def __exit__(self, *args):
+            if stage == 'close_before':
+                fork_now()
+            self.iterator.close()
+            if stage == 'close_after':
+                fork_now()
+
+    previous = signal.signal(signal.SIGUSR1, fork_now)
+    try:
+        with locked(sandbox) as evidence:
+            prepare(evidence, manifest())
+            target = evidence._fd
+            if operation == 'verify':
+                target = fs._directory(evidence._fd, 'op-1')
+            baseline = set(os.listdir('/proc/self/fd'))
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(fs.os, 'scandir', Iterator)
+                    patch.setattr(fs.os, '_exit', inspected_exit)
+                    if operation == 'discover':
+                        assert evidence.discover() == {'op-1': 'unresolved'}
+                    elif operation == 'verify':
+                        fs._entries(target, {'manifest.json', 'candidate.json'})
+                    else:
+                        with fs._scandir(target) as entries:
+                            next(entries)
+                assert fired
+                assert _reap(children.pop()) == 1
+                import select
+
+                assert select.select([reports_read], [], [], 5)[0]
+                report = os.read(reports_read, 1)
+                assert report == (b'A' if expected_alias else b'N')
+                assert fs._fd_transitions == 0
+                assert set(os.listdir('/proc/self/fd')) == baseline
+                with pytest.raises(BlockingIOError), locked(sandbox):
+                    pass
+                assert evidence.read_candidate('op-1') == canonical()
+            finally:
+                if operation == 'verify':
+                    fs._close(target)
+        with locked(sandbox):
+            pass
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+        for pid in children:
+            _reap(pid)
+        os.close(reports_read)
+        os.close(reports_write)
+
+
+@pytest.mark.parametrize('failure', ['construction', 'iteration', 'body', 'close'])
+def test_enumeration_exception_cleanup(sandbox, monkeypatch, failure):
+    real_scandir = os.scandir
+    before = set(os.listdir('/proc/self/fd'))
+    depth = fs._fd_transitions
+
+    class Iterator:
+        def __init__(self, directory):
+            if failure == 'construction':
+                raise RuntimeError('injected')
+            self.iterator = real_scandir(directory)
+
+        def __enter__(self):
+            return self
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise RuntimeError('injected')
+
+        def __exit__(self, *args):
+            self.iterator.close()
+            if failure == 'close':
+                raise RuntimeError('injected')
+
+    monkeypatch.setattr(fs.os, 'scandir', Iterator)
+    with pytest.raises(RuntimeError), fs._scandir(sandbox[1]) as entries:
+        if failure == 'body':
+            raise RuntimeError('injected')
+        if failure == 'iteration':
+            next(entries)
+    assert fs._fd_transitions == depth
+    assert set(os.listdir('/proc/self/fd')) == before
+
+
+def test_enumeration_exception_unwinding_fork(sandbox, monkeypatch):
+    """Fork while an enumeration error unwinds, before runtime alias close."""
+    import select
+    import subprocess
+    import sys
+
+    real_scandir = os.scandir
+    real_exit = os._exit
+    children = []
+    reports_read, reports_write = os.pipe()
+    error = RuntimeError('injected enumeration failure')
+    depth = fs._fd_transitions
+    iterators = []
+    aliases = set()
+    target = None
+
+    def lock_probe(expected):
+        # A fresh interpreter uses its own open file description. It must not
+        # inherit the parent's lock or execute the unsafe-depth fork callback.
+        result = subprocess.run(  # noqa: S603 - fixed code and disposable fixture path
+            [sys.executable, '-c',
+             'import fcntl, os, sys\n'
+             'fd = os.open(sys.argv[1], os.O_RDWR)\n'
+             'try:\n'
+             '    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n'
+             'except BlockingIOError:\n'
+             '    sys.exit(23)\n'
+             'finally:\n'
+             '    os.close(fd)\n',
+             str(sandbox[0] / 'admin.lock')],
+            close_fds=True, capture_output=True, timeout=5, check=False)
+        assert result.returncode == expected, result.stderr
+
+    def inspected_exit(status):
+        # This runs only inside the established at-fork fatal callback. Prove
+        # the exact runtime alias still exists and is usable before termination.
+        live = aliases <= _inode_fds(target)
+        usable = all(os.stat('.', dir_fd=fd).st_ino == os.fstat(target).st_ino
+                     for fd in aliases)
+        os.write(reports_write, b'A' if aliases and live and usable else b'N')
+        real_exit(status)
+
+    class Iterator:
+        def __init__(self, directory):
+            self.iterator = real_scandir(directory)
+            self.closed = False
+            self.advanced = False
+            iterators.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            # Advance the actual iterator without exhausting it, then fail on
+            # the next step so this is active enumeration, not a body error.
+            if not self.advanced:
+                self.advanced = True
+                return next(self.iterator)
+            raise error
+
+        def __exit__(self, exc_type, exc, traceback):
+            try:
+                assert exc_type is RuntimeError and exc is error
+                assert traceback is not None and self.advanced and not self.closed
+                aliases.update(_inode_fds(target) - before_aliases)
+                assert len(aliases) == 1
+                transition_depth = fs._fd_transitions
+                lock_probe(23)
+                pid = os.fork()
+                if pid == 0:
+                    os.write(reports_write, b'S')  # Forbidden Python continuation.
+                    real_exit(99)
+                children.append(pid)
+                try:
+                    status = _reap(pid)
+                finally:
+                    children.remove(pid)
+                assert status == 1
+                assert select.select([reports_read], [], [], 5)[0]
+                assert os.read(reports_read, 16) == b'A'
+                assert transition_depth == depth + 1
+                assert aliases <= _inode_fds(target)  # Parent alias still live.
+                lock_probe(23)  # Child exit must not unlock the parent's flock.
+            finally:
+                self.iterator.close()
+                self.closed = True
+
+    try:
+        with locked(sandbox) as evidence:
+            prepare(evidence, manifest())
+            target = evidence._fd
+            before_aliases = _inode_fds(target)
+            before_fds = set(os.listdir('/proc/self/fd'))
+            with monkeypatch.context() as patch:
+                patch.setattr(fs.os, 'scandir', Iterator)
+                patch.setattr(fs.os, '_exit', inspected_exit)
+                with pytest.raises(RuntimeError, match='injected enumeration failure') as raised:
+                    fs._entries(target, {'op-1'})
+            assert raised.value is error
+            assert len(iterators) == 1 and iterators[0].closed
+            assert _inode_fds(target) == before_aliases
+            assert set(os.listdir('/proc/self/fd')) == before_fds
+            assert fs._fd_transitions == depth
+            lock_probe(23)
+            assert evidence.read_candidate('op-1') == canonical()
+        lock_probe(0)
+        with locked(sandbox):
+            pass
+    finally:
+        for pid in children:
+            _reap(pid)
+        os.close(reports_read)
+        os.close(reports_write)

@@ -1,17 +1,23 @@
-"""Internal root administration evidence only; no database or policy access.
+"""Internal protected candidate staging; no database or live-policy access.
 
 The CLI deliberately does not invoke these primitives yet.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import re
 import secrets
 import stat
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from functools import wraps
+
+from soc_automation.approval import _policy_content
+from soc_automation.approval_policy import policy_from_content
+
+POLICY_LIMIT = 65536
 
 ADMIN_PATH = '/var/lib/soc-policy-admin'
 LOCK_PATH = ADMIN_PATH + '/admin.lock'
@@ -121,6 +127,7 @@ def _safe(info, *, directory, private=True):
     if (info.st_uid != 0 or (not stat.S_ISDIR(info.st_mode) if directory
                             else not stat.S_ISREG(info.st_mode))
             or (mode != (0o700 if directory else 0o600) if private else mode & 0o022)
+            or (not directory and not private and mode & 0o7111)
             or (not directory and info.st_nlink != 1)):
         raise EvidenceError('Unsafe administrative path')
 
@@ -157,7 +164,7 @@ def _manifest(value):
     if type(value) is not dict or set(value) != fields:
         raise EvidenceError('Invalid manifest fields')
     _id(value['operation_id'])
-    if (type(value['version']) is not int or value['version'] != 1
+    if (type(value['version']) is not int or value['version'] not in (1, 2)
             or value['operation'] not in ('install', 'rotate')
             or value['state'] not in ('prepared', 'completed')
             or type(value['change_reference']) is not str
@@ -197,12 +204,116 @@ def _reject_number(value):
     raise EvidenceError('Noninteger manifest number')
 
 
-def _only_manifest(directory):
-    # Inspect at most two entries, including interrupted temporary files.
-    with os.scandir(directory) as entries:
-        first = next(entries, None)
-        return (first is not None and first.name == 'manifest.json'
-                and next(entries, None) is None)
+_METADATA = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink',
+             'st_size', 'st_mtime_ns', 'st_ctime_ns')
+
+
+def _read_bytes(parent, name, fd, *, limit, private=True):
+    """Bound allocation and check both the pinned inode and its named binding."""
+    _same(parent, name, fd, directory=False, private=private)
+    before = os.fstat(fd)
+    if before.st_size > limit:
+        raise EvidenceError('File too large')
+    chunks = []
+    size = 0
+    while size <= limit:
+        chunk = os.read(fd, min(8192, limit + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    after = os.fstat(fd)
+    if (any(getattr(before, key) != getattr(after, key) for key in _METADATA)
+            or size != before.st_size or size > limit):
+        raise EvidenceError('File changed or too large')
+    _same(parent, name, fd, directory=False, private=private)
+    return b''.join(chunks)
+
+
+@_serialized
+def _source_bytes(path):
+    """Read an explicit protected source with registered, pinned ancestors."""
+    _root()
+    if not _fork_ready:
+        raise EvidenceError('Fork safety unavailable')
+    if (type(path) is not str or not path.startswith('/') or '\x00' in path
+            or len(path.encode('utf-8')) > 4096
+            or any(part in ('', '.', '..') for part in path.split('/')[1:])):
+        raise EvidenceError('Explicit normalized absolute source required')
+    parts = path.split('/')[1:]
+    descriptors = []
+    links = []
+    pid = os.getpid()
+    try:
+        fd = _open('/', DIR_FLAGS)
+        descriptors.append(fd)
+        _safe(os.fstat(fd), directory=True, private=False)
+        for name in parts[:-1]:
+            parent = fd
+            fd = _open(name, DIR_FLAGS, dir_fd=parent)
+            descriptors.append(fd)
+            _same(parent, name, fd, directory=True, private=False)
+            links.append((parent, name, fd))
+        parent = fd
+        fd = _open(parts[-1], os.O_RDONLY | FILE_FLAGS, dir_fd=parent)
+        descriptors.append(fd)
+        data = _read_bytes(parent, parts[-1], fd, limit=POLICY_LIMIT, private=False)
+        _safe(os.fstat(descriptors[0]), directory=True, private=False)
+        for parent, name, child in links:
+            _same(parent, name, child, directory=True, private=False)
+        return data
+    finally:
+        if os.getpid() == pid:
+            with ExitStack() as cleanup:
+                for fd in descriptors:
+                    cleanup.callback(_close, fd)
+
+
+def _canonical(data):
+    policy = policy_from_content(data.decode('utf-8'))
+    content = _policy_content(policy).encode('utf-8')
+    if not 1 <= len(content) <= POLICY_LIMIT:
+        raise EvidenceError('Canonical policy too large')
+    return policy, content
+
+
+def _binding(value, data):
+    policy, canonical = _canonical(data)
+    if (canonical != data or value['candidate_size'] != len(data)
+            or value['candidate_sha256'] != hashlib.sha256(data).hexdigest()
+            or value['candidate_version'] != policy.version):
+        raise EvidenceError('Contradictory candidate binding')
+
+
+@contextmanager
+def _scandir(directory):
+    """Protect runtime-owned aliases from construction through iterator close.
+
+    scandir(fd) duplicates fd before returning its iterator. Exhaustion or close
+    releases that alias; closing fd itself does not. Keep the unsafe depth set
+    during construction and context exit too, so a reentrant Python fork exits
+    in its child callback before resuming.
+    """
+    global _fd_transitions
+    with _fork_gate:
+        _fd_transitions += 1
+        try:
+            with os.scandir(directory) as entries:
+                yield entries
+        finally:
+            _fd_transitions -= 1
+
+
+def _entries(directory, expected):
+    # Bounded inspection also detects interrupted temporary publications.
+    with _scandir(directory) as entries:
+        names = set()
+        for entry in entries:
+            names.add(entry.name)
+            if len(names) > len(expected):
+                raise EvidenceError('Unexpected evidence')
+    if names != expected:
+        raise EvidenceError('Incomplete or unexpected evidence')
 
 
 class _Evidence:
@@ -226,7 +337,7 @@ class _Evidence:
         """Return ID -> completed/unresolved/corrupt; empty mapping means no operation."""
         self._guard()
         result = {}
-        with os.scandir(self._fd) as entries:
+        with _scandir(self._fd) as entries:
             for entry in entries:
                 if len(result) >= OPERATION_LIMIT:
                     raise EvidenceError('Too many operations')
@@ -235,9 +346,8 @@ class _Evidence:
                     _id(name)
                     fd = _directory(self._fd, name)
                     try:
-                        if not _only_manifest(fd):
-                            raise EvidenceError('Incomplete or unexpected evidence')
                         value = self._read(fd, name)
+                        self._verify(fd, value)
                         _same(self._fd, name, fd, directory=True)
                         result[name] = ('completed' if value['state'] == 'completed'
                                         else 'unresolved')
@@ -253,18 +363,7 @@ class _Evidence:
         self._guard()
         fd = _open('manifest.json', os.O_RDONLY | FILE_FLAGS, dir_fd=directory)
         try:
-            _same(directory, 'manifest.json', fd, directory=False)
-            before = os.fstat(fd)
-            if before.st_size > MANIFEST_LIMIT:
-                raise EvidenceError('Manifest too large')
-            data = os.read(fd, MANIFEST_LIMIT + 1)
-            after = os.fstat(fd)
-            fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink',
-                      'st_size', 'st_mtime_ns', 'st_ctime_ns')
-            if (any(getattr(before, key) != getattr(after, key) for key in fields)
-                    or len(data) != before.st_size or len(data) > MANIFEST_LIMIT):
-                raise EvidenceError('Manifest changed')
-            _same(directory, 'manifest.json', fd, directory=False)
+            data = _read_bytes(directory, 'manifest.json', fd, limit=MANIFEST_LIMIT)
             value = json.loads(data.decode('utf-8'), object_pairs_hook=_pairs,
                                parse_float=_reject_number, parse_constant=_reject_number)
             _manifest(value)
@@ -275,10 +374,14 @@ class _Evidence:
             _close(fd)
 
     @_serialized
-    def prepare(self, value):
-        """Persist metadata intent only, refusing any previous evidence."""
+    def prepare(self, value, source_path):
+        """Persist a verified immutable candidate, refusing any previous evidence."""
         self._guard()
         data = _manifest(value)
+        if value['version'] != 2:
+            raise EvidenceError('New preparation requires manifest version 2')
+        _, candidate = _canonical(_source_bytes(source_path))
+        _binding(value, candidate)
         if value['state'] != 'prepared':
             raise EvidenceError('Preparation requires prepared state')
         if self.discover():
@@ -288,7 +391,19 @@ class _Evidence:
         os.fsync(self._fd)
         fd = _directory(self._fd, name)
         try:
-            self._write(fd, data)
+            candidate_fd = _open('candidate.json',
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | FILE_FLAGS,
+                                 0o600, dir_fd=fd)
+            try:
+                _same(fd, 'candidate.json', candidate_fd, directory=False)
+                self._write_all(candidate_fd, candidate)
+                os.fsync(candidate_fd)
+                _same(fd, 'candidate.json', candidate_fd, directory=False)
+            finally:
+                _close(candidate_fd)
+            os.fsync(fd)
+            self._verify(fd, value, preparing=True)
+            self._publish(fd, name, value, data)
             _same(self._fd, name, fd, directory=True)
             self._guard()
         finally:
@@ -305,17 +420,80 @@ class _Evidence:
         name = value['operation_id']
         fd = _directory(self._fd, name)
         try:
-            if not _only_manifest(fd):
-                raise EvidenceError('Unexpected evidence')
             old = self._read(fd, name)
+            self._verify(fd, old)
             if old['state'] != 'prepared' or any(
                     old[key] != value[key] for key in old if key != 'state'):
                 raise EvidenceError('Contradictory evidence update')
-            self._write(fd, data)
+            self._publish(fd, name, value, data)
             _same(self._fd, name, fd, directory=True)
             self._guard()
         finally:
             _close(fd)
+
+    @_serialized
+    def _publish(self, directory, name, value, data):
+        self._guard()
+        before = (os.stat('candidate.json', dir_fd=directory, follow_symlinks=False)
+                  if value['version'] == 2 else None)
+        self._write(directory, data)
+        persisted = self._read(directory, name)
+        if persisted != value:
+            raise EvidenceError('Manifest publication changed')
+        self._verify(directory, persisted)
+        if before is not None:
+            after = os.stat('candidate.json', dir_fd=directory, follow_symlinks=False)
+            if any(getattr(before, key) != getattr(after, key) for key in _METADATA):
+                raise EvidenceError('Candidate changed during publication')
+
+    @_serialized
+    def _verify(self, directory, value, *, preparing=False):
+        self._guard()
+        expected = set() if preparing else {'manifest.json'}
+        if value['version'] == 1:
+            _entries(directory, expected)
+            return None
+        expected.add('candidate.json')
+        _entries(directory, expected)
+        fd = _open('candidate.json', os.O_RDONLY | FILE_FLAGS, dir_fd=directory)
+        try:
+            before = os.fstat(fd)
+            data = _read_bytes(directory, 'candidate.json', fd, limit=POLICY_LIMIT)
+            _binding(value, data)
+            after = os.fstat(fd)
+            if any(getattr(before, key) != getattr(after, key) for key in _METADATA):
+                raise EvidenceError('Candidate changed during validation')
+            _same(directory, 'candidate.json', fd, directory=False)
+            _entries(directory, expected)
+            return data
+        finally:
+            _close(fd)
+
+    @_serialized
+    def read_candidate(self, operation_id):
+        """Return verified immutable bytes, never a descriptor or pathname."""
+        self._guard()
+        name = _id(operation_id)
+        fd = _directory(self._fd, name)
+        try:
+            value = self._read(fd, name)
+            if value['version'] != 2:
+                raise EvidenceError('Legacy metadata has no staged candidate')
+            data = self._verify(fd, value)
+            _same(self._fd, name, fd, directory=True)
+            self._guard()
+            return data
+        finally:
+            _close(fd)
+
+    @staticmethod
+    def _write_all(fd, data):
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError('Short evidence write')
+            view = view[written:]
 
     @_serialized
     def _write(self, directory, data):
@@ -325,12 +503,7 @@ class _Evidence:
                      0o600, dir_fd=directory)
         try:
             _same(directory, name, fd, directory=False)
-            view = memoryview(data)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise OSError('Short manifest write')
-                view = view[written:]
+            self._write_all(fd, data)
             os.fsync(fd)
             _same(directory, name, fd, directory=False)
             os.rename(name, 'manifest.json', src_dir_fd=directory, dst_dir_fd=directory)

@@ -1,4 +1,4 @@
-# Trusted policy administration foundation — Phase 2B-2
+# Trusted policy administration foundation — Phase 2B-3
 
 ## Scope and implementation status
 
@@ -6,9 +6,9 @@ Implemented: `inspect_policy_ledger(store, *, deadline=None)` in
 `approval_policy.py`, immutable `PolicyLedger` / `PolicyGeneration` results,
 shared runtime history validation, raw/canonical size guards, and the separate
 root-only read-only `soc-policy-admin` CLI described below. No administrative
-daemon, socket, privileged policy writer, staging, policy replacement, recovery,
-or deployment action is implemented. Internal lock and metadata-manifest primitives
-are implemented in `policy_admin_fs.py`; the CLI does not invoke them. Mutation interfaces below remain a design
+daemon, socket, privileged policy writer, policy replacement, recovery,
+or deployment action is implemented. Internal protected candidate staging, locking
+and evidence primitives are implemented in `policy_admin_fs.py`; the CLI does not invoke them. Mutation interfaces below remain a design
 contract for subsequent review; their CLI commands explicitly refuse execution.
 
 There is one authoritative SQLite database, one trusted soc-automation writer UID,
@@ -354,7 +354,7 @@ This exercises JSON dispatch, malformed arguments, disabled installation and
 exit-code propagation without real root or persistent state. The existing project
 virtual environment and host installation are not modified.
 
-## Implemented protected evidence primitives (Phase 2B-2)
+## Implemented protected evidence primitives (Phase 2B-3)
 
 `policy_admin_fs.administration()` is an internal context manager with no path or
 owner override. It requires both real and effective UID 0 before filesystem
@@ -401,61 +401,119 @@ Python callbacks. Arbitrary native forks are outside this guarantee.
 
 The context yields an internal `_Evidence` handle:
 
-* `discover()` returns an ID-to-classification mapping. Empty means no operation;
-  valid `completed` evidence is distinct from `unresolved` prepared evidence and
-  `corrupt` evidence. Unsafe entries, invalid IDs, missing manifests, unknown
-  files, interrupted temporary files, or contradictory IDs are corrupt.
-* `prepare(manifest)` refuses any previous operation evidence, including completed,
-  unresolved and corrupt entries, validates metadata,
-  and exclusively creates a new operation directory. IDs use the CLI's bounded
-  ASCII operation-ID grammar. Existing IDs are never reused, including completed
-  IDs. Directory creation is fsynced before manifest writing.
-* `update(manifest)` preserves every metadata field and accepts updates only
-  from prepared evidence. A completed state is an assertion by trusted internal
-  caller code, requiring independently established authority in any future
-  integration. No completion proof or ledger reconciliation exists in this slice.
+* `prepare(manifest, source_path)` requires schema version 2 and an explicit,
+  normalized absolute source pathname, at most 4096 UTF-8 bytes. It validates the
+  source and manifest entirely in memory before creating an operation directory.
+  Any existing history (completed, unresolved, corrupt or legacy) blocks preparation.
+* `read_candidate(operation_id)` returns verified immutable `bytes`, never a writable
+  descriptor or pathname. Version-1 metadata cannot supply a staged candidate.
+* `discover()` returns ID-to-classification mappings: `completed`, `unresolved`,
+  or `corrupt`. Version-2 evidence must pass candidate verification before either
+  completed or unresolved can be reported. At most 1024 operations are inspected.
+* `update(manifest)` verifies the candidate before and after publication and
+  preserves all metadata except state. Only prepared evidence can be updated.
+  A completed state is a local evidence assertion, never proof of a committed
+  policy generation, live-file agreement or permission to resume service.
 
-Manifest schema version 1 has exactly `version`, `operation_id`, `operation`
+### Manifest and protected candidate contract
+
+Schema versions 1 and 2 have exactly `version`, `operation_id`, `operation`
 (`install` or `rotate`), `change_reference`, `state` (`prepared` or `completed`),
 `expected_generation`, `expected_current_sha256`, `candidate_sha256`,
-`candidate_version`, and `candidate_size`. Candidate metadata describes canonical
-UTF-8 policy bytes: lowercase SHA-256, exact version (1–256 UTF-8 bytes, no control
-characters), and size (1–65536 bytes). The caller supplies validated canonical
-metadata; these primitives neither read nor stage candidate content and cannot
-verify its digest. Install requires expected generation 0 and null current digest;
-rotate requires a positive generation below 9223372036854775807 and an explicit
-current digest. No implicit generation/digest inference occurs.
+`candidate_version`, and `candidate_size`. Manifests are limited to 4096 bytes,
+written as sorted compact ASCII JSON. Reads reject unknown/missing fields,
+duplicate keys, unsupported versions, invalid types including boolean integers,
+and contradictory operation IDs or expectations.
 
-Manifests are at most 4096 bytes, use compact sorted JSON on write, and reject
-unknown/missing fields, duplicate keys, invalid types (including boolean integers),
-inconsistent expectations, unsupported versions and malformed states on read.
-Discovery bounds operations to 1024, failing closed above that limit. It reads at
-most 4097 manifest bytes and inspects at most two entries inside an operation
-directory before rejecting extra evidence. It checks file identity and metadata
-around reading. The handle rejects use after context exit.
+Version 2 requires exactly this root-owned protected layout:
 
-Each update creates a random exclusive no-follow temporary file in the operation
-directory, writes all bytes, fsyncs the file, atomically renames it to
-`manifest.json`, then fsyncs the directory. Readers see the old or new complete
-manifest under the cooperating lock. An exception never reports durable success.
-Before rename, an interrupted temporary file remains as blocking corrupt evidence;
-a newly created empty operation directory also blocks. After rename but before
-successful directory fsync, visibility and reboot durability differ: discovery
-classifies the bytes actually present, and cannot reconstruct whether fsync
-previously succeeded. After reboot either the prior or replacement evidence may
-survive according to filesystem guarantees. Completed evidence never proves a
-SQLite commit, live-file agreement, or permission to resume service.
+```text
+/var/lib/soc-policy-admin/operations/<operation-id>/  (0700)
+    candidate.json                                  (0600, one link)
+    manifest.json                                   (0600, one link)
+```
 
-No automatic cleanup, abandonment, recovery, ledger access, policy-file access,
-policy staging, maintenance gating, privilege-dropping child, or installation is
-provided. Only empty operation history permits preparation. Any prior evidence
-blocks further preparation until authoritative admission verification is implemented
-and independently reviewed. No manifest label, timestamp or manifest content
-establishes a committed generation or ledger authority; there is no override. Do not
-remove evidence to bypass this block. Recovery and admission procedures remain
-deferred; install, rotate and recover remain disabled in the CLI. The private
-`_locked_at` descriptor seam exists for disposable filesystem unit tests, not as a
-configurable production trust boundary. Tests substitute fixture ownership and
-identity and do not need actual root privileges. Unit fault injection cannot
-establish power-loss durability, deployed permissions or filesystem lock support;
-independent review and future host acceptance are still required.
+Version 1 remains readable legacy metadata-only evidence, with exactly
+`manifest.json`. Its existing discovery and state-update semantics remain,
+but new version-1 preparation and all version-1 candidate reads are rejected.
+Adding a candidate file to legacy evidence makes its layout corrupt; metadata
+alone cannot be promoted into verified staging evidence.
+
+The sole semantic parser is `approval_policy.policy_from_content()` and the sole
+policy serializer is `approval._policy_content()`. All ReviewPolicy fields and
+tuple ordering are preserved; frozensets and JSON keys are sorted, separators
+are compact, non-ASCII characters are escaped, and UTF-8 bytes have no trailing
+newline. Both raw source and canonical policy limits are inclusive 65,536 bytes.
+Different JSON formatting produces identical staged bytes when policy semantics
+are identical. Tuple reordering retains its existing semantic significance.
+
+The manifest binds the exact candidate version, lowercase SHA-256 and byte count
+to its directory's exact operation ID. Verification parses the persisted bytes,
+repeats semantic validation and requires exact equality with canonical bytes.
+Install expects generation 0 and a null current digest; rotate expects a positive
+generation below 9223372036854775807 and an explicit lowercase current digest.
+These remain caller expectations, not verified ledger facts. No database or live
+policy is opened by staging.
+
+### Protected reading, persistence and failure behavior
+
+The source reader pins every ancestor from `/`, uses descriptor-relative opens
+with `O_NOFOLLOW` and `O_CLOEXEC`, and rejects empty, dot, dot-dot and NUL path
+components. Ancestors and source must be root-owned without group/other writes;
+source files must be single-link regular files without executable or special mode
+bits. Symlinks, directories, FIFOs and other nonregular sources are rejected.
+Reads are bounded before parsing, support short reads, compare inode metadata
+before/after, verify opened inode against the named entry, and recheck all ancestor
+bindings afterward. Explicitly opened source and candidate descriptors use the
+same fork-safe registration and cleanup as the lock. Directory enumeration can
+create runtime-owned descriptor aliases that are not directly registered. An
+unsafe transition boundary covers iterator construction, iteration and close,
+including exceptions. A child forked within that boundary terminates inside its
+Python at-fork callback before returning; other threads wait at the fork barrier.
+Closing the original directory descriptor does not close an enumeration alias,
+and `O_CLOEXEC` does not prevent fork inheritance.
+The administrative lock spans the entire context, including caller work.
+
+Preparation follows this order:
+
+1. Validate source and manifest in memory and reject all previous history.
+2. Exclusively create the operation directory and fsync `operations`.
+3. Exclusively create `candidate.json`, without truncation, overwrite, hardlink,
+   rename replacement or symlink following. Require root ownership, exact 0600
+   mode and one link.
+4. Fully write canonical bytes and fsync the candidate; close its writable
+   descriptor, then fsync the operation directory.
+5. Reopen read-only and verify persisted length, digest, version, semantics,
+   canonical equality, descriptor/path identity and exact directory contents.
+6. Publish the manifest using the existing exclusive temporary creation, full
+   write, file fsync, atomic rename and operation-directory fsync mechanism.
+7. Reverify the manifest, candidate, directory and parent bindings before success.
+   Candidate metadata and identity must remain stable across publication.
+
+Missing, truncated, altered, oversized, noncanonical or mismatched candidates are
+corrupt evidence. Unknown entries, interrupted manifest temporary files and empty
+operation directories are also corrupt. Candidate bytes are never rewritten by
+manifest state updates. Immutability is enforced by this internal interface and
+protected permissions; it does not prevent a privileged root from tampering.
+
+After operation-directory creation every partial operation is retained. Write,
+close, fsync, rename and verification errors propagate without reporting success.
+There is no retry into an existing directory, silent cleanup, automatic repair,
+abandonment, inferred installation or recovery. Any remaining history blocks
+subsequent preparation. Do not delete evidence to bypass the block.
+
+Before manifest publication, a crash can leave an empty directory, partial
+candidate, or verified candidate without a manifest. These are incomplete blocking
+evidence. Before manifest rename an interrupted temporary remains blocking;
+after rename but before successful directory fsync, visible content and reboot
+durability can differ. Discovery describes only evidence actually present; it
+cannot reconstruct whether a previous fsync succeeded. Real power-loss behavior
+depends on the trusted local filesystem and storage stack.
+
+Installation, rotation, recovery, policy publication, maintenance admission,
+privilege-dropping database writers and service resumption remain deferred.
+The CLI still rejects install, rotate and recover before candidate access.
+The private `_locked_at` descriptor seam exists only for disposable tests, not
+as a configurable production trust boundary. Tests do not establish host
+permissions, physical power-loss durability or protection against hostile root.
+Independent review is required before any future integration enables mutation.
