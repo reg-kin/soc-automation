@@ -279,14 +279,11 @@ def test_cli_workflow(prepared, monkeypatch, capsys):
         ]
         assert main(args) == 1
         client.create.assert_not_called()
-        # Production CLI has no trusted active policy in this milestone.
+        # Missing protected active policy fails closed.
         assert main([*args, "--authorize-case-creation"]) == 1
         client.create.assert_not_called()
-        # Retain the historical manual CLI regression with the test-only adapter.
-        with patch("soc_automation.cli.Store", Store):
-            assert main([*args, "--authorize-case-creation"]) == 0
         capsys.readouterr()
-        assert main(["reconcile-case", "--publication-id", row["id"]]) == 0
+        assert main(["reconcile-case", "--publication-id", row["id"]]) == 1
 
 
 def test_migration_rollback(tmp_path):

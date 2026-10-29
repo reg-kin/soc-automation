@@ -9,6 +9,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from soc_automation import operator_cli, preparation_coordinator
+from soc_automation.approval_daemon import POLICY as APPROVAL_POLICY
+from soc_automation.approval_policy import PolicySource
 from soc_automation.config import (
     ConfigurationError,
     ElasticsearchSettings,
@@ -229,6 +231,13 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env()
         logger = configure_logging(settings.log_level)
         store = Store(settings.database_path, settings.database_timeout_seconds)
+        if args.command == "publish-case":
+            policy = PolicySource(APPROVAL_POLICY).load(store)
+            store = Store(
+                settings.database_path,
+                settings.database_timeout_seconds,
+                publication_policy=policy,
+            )
         if args.command in {"list-case-publications", "review-case-publication"}:
             if args.command == "list-case-publications":
                 target = args.target
